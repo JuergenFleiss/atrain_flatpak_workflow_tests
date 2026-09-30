@@ -4,6 +4,7 @@ from nicegui import ui
 def sidebar():
     with ui.left_drawer().classes("bg-gray-100") as drawer_handle:
         nav_button(icon="🎧", text="Transcribe", path="/")
+        nav_button(icon="⏳", text="Queue", path="/queue")
         nav_button(icon="💾", text="Archive", path="/archive")
         nav_button(icon="🧮", text="Models", path="/models")
         nav_button(icon="📖", text="FAQ", path="/faq")

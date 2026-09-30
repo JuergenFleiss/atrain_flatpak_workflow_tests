@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 
 from aTrain_core.globals import ATRAIN_DIR
-from aTrain_core.jobs import JobSpec, JobStore
+from aTrain_core.jobs import JobSpec, JobStore, QueueLockedError
 from aTrain_core.queue_service import QueueService
 from aTrain_core.settings import ComputeType, Device
 from nicegui import app
@@ -13,6 +13,8 @@ LOCKED_TEXT = (
     "aTrain is already transcribing in another window or on the command line. "
     "Close it to transcribe here."
 )
+
+QUEUE_ROOT = ATRAIN_DIR / "queue"
 
 _service: QueueService | None = None
 _loop: asyncio.AbstractEventLoop | None = None
@@ -30,11 +32,20 @@ async def get_queue_service() -> QueueService:
         _service._lock.release()
         _service = None
     if _service is None:
-        service = QueueService(JobStore(ATRAIN_DIR / "queue"))
+        service = QueueService(JobStore(QUEUE_ROOT))
         await service.start()
         _service, _loop = service, loop
         app.on_shutdown(_stop)
     return _service
+
+
+async def start_queue_service() -> None:
+    """App startup: start the queue, so jobs of an earlier session continue. If another
+    aTrain process holds the lock, the pages show a banner instead."""
+    try:
+        await get_queue_service()
+    except QueueLockedError:
+        pass
 
 
 async def _stop() -> None:

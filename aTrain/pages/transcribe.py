@@ -17,6 +17,8 @@ from nicegui import Client, app, ui
 async def page(client: Client):
     await client.connected()
     await splash_screen()
+    if client.is_deleted:
+        return  # the window loaded the page again while the splash screen was waiting
     with base_layout():
         with ui.element("div").classes(
             "w-full h-full grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-10"

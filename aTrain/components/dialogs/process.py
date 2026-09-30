@@ -1,17 +1,16 @@
 import logging
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from importlib.resources import files
-from multiprocessing.managers import DictProxy
 from pathlib import Path
 from typing import cast
 
 from nicegui import ElementFilter, app, ui
-from nicegui.run import tear_down as stop_transcription
 
 GIF_PROCESS = cast(Path, files("aTrain") / "static" / "images" / "process.gif")
 
 
-def dialog_process(progress: DictProxy):
+def dialog_process(progress: Mapping, on_stop: Callable):
     state = app.storage.general
     start_time = datetime.now()
     ui.timer(0.1, lambda: update_progress(progress, start_time)).mark("timer_process")
@@ -34,10 +33,10 @@ def dialog_process(progress: DictProxy):
                 )
                 ui.label("").bind_text_from(state, "time", lambda x: f"Time: {x}")
             btn_stop = ui.button("stop", color="dark").props("unelevated no-caps")
-        btn_stop.on_click(stop_transcription)
+        btn_stop.on_click(on_stop)
 
 
-def update_progress(progress: DictProxy, start_time: datetime):
+def update_progress(progress: Mapping, start_time: datetime):
     state = app.storage.general
     try:
         current, total, task = progress["current"], progress["total"], progress["task"]
@@ -52,7 +51,7 @@ def update_progress(progress: DictProxy, start_time: datetime):
     state["progress"] = current / total
     state["task"] = task
     total_tasks = 3 if state["speaker_detection"] else 2
-    current_task = {"Prepare": 1, "Transcribe": 2, "Detect Speakers": 3}[task]
+    current_task = {"Prepare": 1, "Transcribe": 2, "Detect Speakers": 3}.get(task, 1)
     state["task_number"] = f"{current_task}/{total_tasks}"
     update_time(start_time)
 

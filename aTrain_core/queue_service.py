@@ -1,0 +1,364 @@
+"""The queue service: decides which job runs, starts and kills the phase children, and is
+the only writer of the job store. Runs on one asyncio loop; no NiceGUI.
+
+Commands change state without awaiting in between, so they can't interleave with a
+dispatch. The only await in a command is the kill in cancel(); while a child is being
+killed it gets NoMoreWork.
+"""
+
+import asyncio
+import logging
+import shutil
+from collections.abc import Callable
+from datetime import datetime
+
+from aTrain_core import outputs
+from aTrain_core.globals import TIMESTAMP_FORMAT
+from aTrain_core.jobs import (
+    FINAL_STATUSES,
+    JobSpec,
+    JobState,
+    JobStatus,
+    JobStore,
+    QueueLock,
+    Step,
+    resume_status,
+)
+from aTrain_core.runner import (
+    RAW_CHECKPOINT,
+    Dispatch,
+    JobDone,
+    JobFailed,
+    JobFileId,
+    JobProgress,
+    JobTranscribed,
+    ModelLoaded,
+    NextJob,
+    NoMoreWork,
+    PhaseDied,
+    PhaseError,
+    PhaseHandle,
+    PhaseJob,
+    launch_phase1,
+    launch_phase2,
+)
+
+log = logging.getLogger(__name__)
+
+
+class QueueService:
+    def __init__(
+        self,
+        store: JobStore,
+        *,
+        launch_phase1: Callable[..., PhaseHandle] = launch_phase1,
+        launch_phase2: Callable[..., PhaseHandle] = launch_phase2,
+    ):
+        self.store = store
+        self.paused = False
+        self._lock = QueueLock(store.root)
+        self._launch = {1: launch_phase1, 2: launch_phase2}
+        self._wake = asyncio.Event()
+        self._scheduler_task: asyncio.Task | None = None
+        self._subscribers: list[Callable[[str], None]] = []
+        self._progress: dict[str, JobProgress] = {}
+        self._stopping = False
+        # the running phase
+        self._handle: PhaseHandle | None = None
+        self._phase: int | None = None
+        self._phase_arg = None  # ModelKey for phase 1, Device for phase 2
+        self._model_loaded = False
+        self._dispatched = 0
+        self._in_flight: str | None = None
+        self._killing = False
+        self._phase_error: PhaseError | None = None
+        self._cancel_requested: set[str] = set()
+
+    # --- lifecycle --------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Take the queue lock (QueueLockedError if another process holds it), put jobs
+        that were running when the app stopped back into the queue, start scheduling."""
+        self._lock.acquire()
+        for spec, state in self.store.jobs():
+            if state.status in (JobStatus.TRANSCRIBING, JobStatus.DIARIZING):
+                self._guarded(spec.id, self._resume, spec.id)
+        self._scheduler_task = asyncio.create_task(self._scheduler())
+        self._wake.set()
+
+    async def stop(self) -> None:
+        """Kill the running child; its job goes back into the queue. Release the lock."""
+        self._stopping = True
+        self._wake.set()
+        if self._handle is not None:
+            await asyncio.to_thread(self._handle.kill)
+        if self._scheduler_task is not None:
+            await self._scheduler_task
+        self._lock.release()
+
+    # --- commands ---------------------------------------------------------------------
+
+    def enqueue(self, specs: list[JobSpec]) -> None:
+        self.store.add(specs)
+        for spec in specs:
+            self._notify(spec.id)
+        self._wake.set()
+
+    async def cancel(self, job_ids: list[str]) -> None:
+        for job_id in job_ids:
+            _, state = self.store.get(job_id)
+            if state.status in FINAL_STATUSES:
+                continue
+            if job_id != self._in_flight:
+                self._guarded(job_id, self.store.update, job_id, status=JobStatus.CANCELLED)
+                self._notify(job_id)
+                continue
+            # The child is killed; events it sent before are still applied, so a job
+            # that has just finished stays DONE.
+            self._cancel_requested.add(job_id)
+            state.cancelling = True
+            self._notify(job_id)
+            self._killing = True
+            if self._handle is not None:
+                await asyncio.to_thread(self._handle.kill)
+
+    def retry(self, job_id: str) -> None:
+        _, state = self.store.get(job_id)
+        if state.status not in (JobStatus.FAILED, JobStatus.CANCELLED):
+            raise ValueError("Only failed or cancelled jobs can be retried")
+        self.store.update(
+            job_id, error=None, traceback=None, failed_step=None, warnings=[], started_at=None
+        )
+        self._resume(job_id)
+        self._wake.set()
+
+    def remove(self, job_id: str) -> None:
+        if job_id == self._in_flight:
+            raise ValueError("The job is running; cancel it first")
+        self.store.remove(job_id)
+        self._progress.pop(job_id, None)
+        self._notify(job_id)
+
+    def clear_finished(self) -> None:
+        for job_id in self.store.clear_finished():
+            self._progress.pop(job_id, None)
+            self._notify(job_id)
+
+    def move(self, job_id: str, delta: int) -> None:
+        self.store.move(job_id, delta)
+        self._notify(job_id)
+
+    def pause(self) -> None:
+        """Hand out no new job; the running one finishes."""
+        self.paused = True
+
+    def resume(self) -> None:
+        self.paused = False
+        self._wake.set()
+
+    # --- read side --------------------------------------------------------------------
+
+    def jobs(self) -> list[tuple[JobSpec, JobState]]:
+        return self.store.jobs()
+
+    def progress(self, job_id: str) -> JobProgress | None:
+        return self._progress.get(job_id)
+
+    def subscribe(self, callback: Callable[[str], None]) -> Callable[[], None]:
+        """Call `callback(job_id)` whenever that job changes. Returns an unsubscribe function."""
+        self._subscribers.append(callback)
+        return lambda: self._subscribers.remove(callback)
+
+    def _notify(self, job_id: str) -> None:
+        for callback in list(self._subscribers):
+            try:
+                callback(job_id)
+            except Exception:
+                log.exception("Queue subscriber failed")
+
+    # --- scheduling -------------------------------------------------------------------
+
+    async def _scheduler(self) -> None:
+        while not self._stopping:
+            await self._wake.wait()
+            self._wake.clear()
+            while not (self._stopping or self.paused) and (head := self._head()) is not None:
+                spec, state = head
+                if state.status == JobStatus.QUEUED:
+                    await self._run_phase(1, spec.model_key)
+                    if not self._stopping and self._eligible(2, spec.device):
+                        # the group's transcripts finish before the next group starts
+                        await self._run_phase(2, spec.device)
+                else:
+                    await self._run_phase(2, spec.device)
+
+    def _head(self) -> tuple[JobSpec, JobState] | None:
+        for spec, state in self.store.jobs():
+            if state.status in (JobStatus.QUEUED, JobStatus.TRANSCRIBED):
+                return spec, state
+        return None
+
+    def _eligible(self, phase: int, arg) -> list[JobSpec]:
+        if phase == 1:
+            return [
+                spec
+                for spec, state in self.store.jobs()
+                if state.status == JobStatus.QUEUED and spec.model_key == arg
+            ]
+        return [
+            spec
+            for spec, state in self.store.jobs()
+            if state.status == JobStatus.TRANSCRIBED and spec.device == arg
+        ]
+
+    async def _run_phase(self, phase: int, arg) -> None:
+        self._phase, self._phase_arg = phase, arg
+        self._model_loaded, self._dispatched, self._in_flight = False, 0, None
+        self._killing, self._phase_error = False, None
+        self._handle = self._launch[phase](arg)
+        try:
+            async for event in self._handle.events():
+                self._guarded(getattr(event, "job_id", self._in_flight), self._on_event, event)
+        finally:
+            self._handle = None
+            self._cancel_requested.clear()
+
+    def _on_event(self, event) -> None:
+        if isinstance(event, ModelLoaded):
+            self._model_loaded = True
+        elif isinstance(event, NextJob):
+            self._handle.reply(self._next_job())
+        elif isinstance(event, PhaseError):
+            self._phase_error = event
+        elif isinstance(event, PhaseDied):
+            self._phase_died(event.exitcode)
+        elif getattr(event, "job_id", None) != self._in_flight:
+            log.debug("Dropped event for a job that isn't in flight: %r", event)
+        elif isinstance(event, JobProgress):
+            self._progress[event.job_id] = event
+            self.store.get(event.job_id)[1].progress = event.current / (event.total or 1)
+            self._notify(event.job_id)
+        elif isinstance(event, JobFileId):
+            self.store.update(event.job_id, file_id=event.file_id)
+        elif isinstance(event, JobTranscribed):
+            self._in_flight = None
+            self.store.update(
+                event.job_id, status=JobStatus.TRANSCRIBED, audio_duration=event.audio_duration
+            )
+            self._notify(event.job_id)
+        elif isinstance(event, JobDone):
+            self._in_flight = None
+            self.store.update(
+                event.job_id,
+                status=JobStatus.DONE,
+                audio_duration=event.audio_duration,
+                warnings=list(event.warnings),
+                finished_at=_now(),
+            )
+            shutil.rmtree(self.store.work_dir(event.job_id), ignore_errors=True)
+            shutil.rmtree(self.store.uploads_root / event.job_id, ignore_errors=True)
+            self._finish(event.job_id)
+        elif isinstance(event, JobFailed):
+            self._in_flight = None
+            self._drop_incomplete_output(event.job_id)
+            self._fail(event.job_id, event.step, event.error, event.traceback)
+
+    def _next_job(self) -> Dispatch | NoMoreWork:
+        if self._killing or self._stopping or self.paused:
+            return NoMoreWork()
+        step = Step.TRANSCRIPTION if self._phase == 1 else Step.DIARIZATION
+        for spec in self._eligible(self._phase, self._phase_arg):
+            if not spec.source.exists():
+                self._fail(spec.id, step, "Source file not found")
+                continue
+            state = self.store.get(spec.id)[1]
+            started_at = state.started_at or _now()
+            running = JobStatus.TRANSCRIBING if self._phase == 1 else JobStatus.DIARIZING
+            self.store.update(spec.id, status=running, started_at=started_at)
+            self._in_flight = spec.id
+            self._dispatched += 1
+            self._notify(spec.id)
+            return Dispatch(PhaseJob(spec, started_at, self.store.work_dir(spec.id)))
+        return NoMoreWork()
+
+    def _phase_died(self, exitcode: int | None) -> None:
+        reason = (
+            self._phase_error.error if self._phase_error else f"process ended with code {exitcode}"
+        )
+        traceback = self._phase_error.traceback if self._phase_error else None
+        job_id, self._in_flight = self._in_flight, None
+        if job_id is not None:
+            _, state = self.store.get(job_id)
+            state.cancelling = False
+            step = self._current_step(state)
+            self._drop_incomplete_output(job_id)
+            if job_id in self._cancel_requested:
+                self.store.update(job_id, status=JobStatus.CANCELLED)
+                self._finish(job_id)
+            elif self._stopping:
+                self._resume(job_id)
+            else:
+                message = f"Processing stopped unexpectedly (possibly out of memory): {reason}"
+                self._fail(job_id, step, message, traceback)
+        elif self._dispatched == 0 and not (self._stopping or self._killing):
+            # The child died before it could work on anything: fail its group, so the
+            # scheduler doesn't start it again and again.
+            step = Step.TRANSCRIPTION if self._phase == 1 else Step.DIARIZATION
+            for spec in self._eligible(self._phase, self._phase_arg):
+                self._fail(spec.id, step, f"Could not load the model: {reason}", traceback)
+
+    def _current_step(self, state: JobState) -> Step:
+        if state.file_id is not None:
+            return Step.OUTPUT
+        return Step.TRANSCRIPTION if state.status == JobStatus.TRANSCRIBING else Step.DIARIZATION
+
+    # --- helpers ----------------------------------------------------------------------
+
+    def _resume(self, job_id: str) -> None:
+        """Back into the queue after a stop, a restart or a retry, keeping finished work."""
+        spec, _ = self.store.get(job_id)
+        self._drop_incomplete_output(job_id)
+        raw = outputs.read_checkpoint(self.store.work_dir(job_id) / RAW_CHECKPOINT, spec.source)
+        self.store.update(job_id, status=resume_status(spec, raw_checkpoint_valid=raw is not None))
+        self._notify(job_id)
+
+    def _fail(self, job_id: str, step: Step, error: str, traceback: str | None = None) -> None:
+        self.store.update(
+            job_id, status=JobStatus.FAILED, failed_step=step, error=error, traceback=traceback
+        )
+        self._finish(job_id)
+
+    def _finish(self, job_id: str) -> None:
+        self._progress.pop(job_id, None)
+        self.store.get(job_id)[1].cancelling = False
+        self._notify(job_id)
+
+    def _drop_incomplete_output(self, job_id: str) -> None:
+        """A job that has an archive folder but isn't DONE was interrupted while writing its
+        outputs: delete the folder, so the archive only holds finished transcriptions."""
+        _, state = self.store.get(job_id)
+        if state.file_id is not None and state.status != JobStatus.DONE:
+            shutil.rmtree(outputs.TRANSCRIPT_DIR / state.file_id, ignore_errors=True)
+            self.store.update(job_id, file_id=None)
+
+    def _guarded(self, job_id: str | None, action: Callable, *args, **kwargs) -> None:
+        """Run a state change; an unexpected error fails only that job, never the scheduler."""
+        try:
+            action(*args, **kwargs)
+        except Exception as e:
+            log.exception("Queue error for job %s", job_id)
+            if job_id is None:
+                return
+            if job_id == self._in_flight:
+                self._in_flight = None
+            try:
+                _, state = self.store.get(job_id)
+                if state.status not in FINAL_STATUSES:
+                    step = state.failed_step or Step.TRANSCRIPTION
+                    self._fail(job_id, step, f"Internal error: {e}")
+            except Exception:
+                log.exception("Could not mark job %s as failed", job_id)
+
+
+def _now() -> str:
+    return datetime.now().strftime(TIMESTAMP_FORMAT)

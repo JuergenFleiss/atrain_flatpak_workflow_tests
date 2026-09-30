@@ -1,19 +1,14 @@
 import traceback
-from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
-from multiprocessing import Manager
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import TypedDict, cast
+from uuid import uuid4
 
 from aTrain.components.dialogs.error import dialog_error
 from aTrain.components.dialogs.finished import dialog_finished
 from aTrain.components.dialogs.process import close_dialog_process, dialog_process
-from aTrain.utils.archive import delete_transcription
-from aTrain_core.settings import ComputeType, Device, Settings, check_inputs_transcribe
-from nicegui import app, events, run, ui
-from nicegui.run import SubprocessException
-from nicegui.run import setup as setup_process_pool
+from aTrain_core.settings import Device, check_inputs_transcribe
+from nicegui import app, events, ui
 
 
 class State(TypedDict):
@@ -66,57 +61,89 @@ async def start_transcription_from_path(path: Path, name: str):
 
 
 async def run_pipeline(payload: UploadPayload):
+    """Add the file as one job to the queue and follow it in the progress dialog."""
     # Lazy import for improved startup speed
-    from aTrain_core.transcribe import prepare_transcription, transcribe
+    from aTrain.utils.queue_ui import LOCKED_TEXT, build_spec_from_state, get_queue_service
+    from aTrain_core.jobs import QueueLockedError
+    from werkzeug.utils import secure_filename
 
-    file_id: str | None = None
-    with Manager() as manager, TemporaryDirectory() as tmp_dir:
-        progress = manager.dict({"task": "Prepare", "current": 0, "total": 999999})
-        dialog_process(progress)
-        # Snapshot rather than read live: the page re-renders while the upload is
-        # staged, and `get_model_options` resets `model` to None whenever no model
-        # is on disk yet. Reading through to the live storage would also let a user
-        # switching the model mid-upload retarget a run that is already under way.
-        state = cast(State, dict(app.storage.general))
+    job_id = uuid4().hex
+    progress = {"task": "Prepare", "current": 0, "total": 999999}
+    # Snapshot rather than read live: the page re-renders while the upload is
+    # staged, and `get_model_options` resets `model` to None whenever no model
+    # is on disk yet. Reading through to the live storage would also let a user
+    # switching the model mid-upload retarget a run that is already under way.
+    state = cast(State, dict(app.storage.general))
+    try:
+        device = Device.GPU if state.get("GPU") else Device.CPU
+        # Validate first: it needs nothing but the name and the settings, and
+        # rejecting a wrong model or language should not cost a full copy of the
+        # upload beforehand.
+        check_inputs_transcribe(payload.name, state.get("model"), state.get("language"), device)
+        service = await get_queue_service()
+    except QueueLockedError:
+        ui.notify(LOCKED_TEXT, color="negative", multi_line=True)
+        return
+    except Exception as e:
+        dialog_error(error=str(e), traceback=traceback.format_exc())
+        return
+
+    dialog_process(progress, on_stop=lambda: service.cancel([job_id]))
+    try:
+        # A browser upload is staged where the queue deletes it once the job is done.
+        staging = service.store.uploads_root / job_id
+        staging.mkdir(parents=True, exist_ok=True)
+        source = await payload.materialise(staging, secure_filename(payload.name) or "upload")
+        if payload.path is not None:
+            staging.rmdir()
+        spec = build_spec_from_state(state, job_id=job_id, source=source, display_name=payload.name)
+        follow_job(service, job_id, progress)
+        service.enqueue([spec])
+    except Exception as e:
+        close_dialog_process()
+        dialog_error(error=str(e), traceback=traceback.format_exc())
+
+
+def follow_job(service, job_id: str, progress: dict) -> None:
+    """Feed the progress dialog from the queue, then show how the job ended."""
+    from aTrain_core.jobs import FINAL_STATUSES, JobStatus
+
+    client = ui.context.client
+
+    def on_change(changed_id: str) -> None:
         try:
-            device = Device.GPU if state.get("GPU") else Device.CPU
-            # Validate first: it needs nothing but the name and the settings, and
-            # rejecting a wrong model or language should not cost a directory and
-            # a full copy of the upload beforehand.
-            check_inputs_transcribe(payload.name, state.get("model"), state.get("language"), device)
-            safe_file, file_id, timestamp = prepare_transcription(Path(payload.name))
-            source = await payload.materialise(Path(tmp_dir), safe_file.name)
-            settings = Settings(
-                file=source,
-                file_id=file_id,
-                file_name=payload.name,
-                model=state.get("model"),
-                language=state.get("language"),
-                speaker_detection=state.get("speaker_detection"),
-                speaker_count=int(state.get("speaker_count") or 0) or None,
-                device=device,
-                compute_type=ComputeType(state.get("compute_type")),
-                timestamp=timestamp,
-                temperature=state.get("temperature_override"),
-                initial_prompt=state.get("initial_prompt") or None,
-                cpu_threads=int(state.get("cpu_threads", 0)) or 0,
-                progress=progress,
-            )
-            await run.cpu_bound(transcribe, settings=settings)
+            _, state = service.store.get(job_id)
+        except KeyError:
+            unsubscribe()
+            return
+        if state.status == JobStatus.QUEUED:
+            ahead = jobs_ahead(service, job_id)
+            progress["task"] = f"Waiting: {ahead} jobs ahead" if ahead else "Prepare"
+        elif changed_id == job_id and (event := service.progress(job_id)) is not None:
+            progress.update(task=event.task, current=event.current, total=event.total)
+        if state.status not in FINAL_STATUSES:
+            return
+        unsubscribe()
+        with client:
             close_dialog_process()
-            dialog_finished(file_id)
+            if state.status == JobStatus.DONE:
+                dialog_finished(state.file_id)
+            elif state.status == JobStatus.FAILED:
+                dialog_error(error=state.error or "", traceback=state.traceback or "")
+            else:
+                ui.navigate.reload()
+        # Nothing shows finished jobs yet (the Queue tab comes later), so don't keep them.
+        service.remove(job_id)
 
-        except BrokenProcessPool:
-            if file_id is not None:
-                delete_transcription(file_id)
-            setup_process_pool()
-            close_dialog_process()
-            ui.navigate.reload()
+    unsubscribe = service.subscribe(on_change)
 
-        except SubprocessException as e:
-            close_dialog_process()
-            dialog_error(error=e.original_message, traceback=e.original_traceback)
 
-        except Exception as e:
-            close_dialog_process()
-            dialog_error(error=str(e), traceback=traceback.format_exc())
+def jobs_ahead(service, job_id: str) -> int:
+    from aTrain_core.jobs import FINAL_STATUSES
+
+    ahead = 0
+    for spec, state in service.jobs():
+        if spec.id == job_id:
+            break
+        ahead += state.status not in FINAL_STATUSES
+    return ahead

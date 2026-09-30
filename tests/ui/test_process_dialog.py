@@ -30,3 +30,12 @@ def test_update_progress_reads_live_dict():
     process.update_progress({"current": 1, "total": 4, "task": "Transcribe"}, datetime.now())
     assert app.storage.general["progress"] == 0.25
     assert app.storage.general["task_number"] == "2/2"
+
+
+def test_update_progress_shows_waiting_as_first_task():
+    app.storage.general["speaker_detection"] = True
+    process.update_progress(
+        {"current": 0, "total": 1, "task": "Waiting: 2 jobs ahead"}, datetime.now()
+    )
+    assert app.storage.general["task"] == "Waiting: 2 jobs ahead"
+    assert app.storage.general["task_number"] == "1/3"

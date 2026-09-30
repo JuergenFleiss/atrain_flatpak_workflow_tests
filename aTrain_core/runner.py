@@ -1,0 +1,423 @@
+"""Child processes that run the two phases of a group of jobs.
+
+Phase 1 loads Whisper once and transcribes; phase 2 loads pyannote once and detects
+speakers. A child never gets a list of jobs: after loading its model it asks the parent
+for one job at a time, so jobs cancelled, removed or reordered meanwhile are handled by
+the parent. Children are spawned, and exit when the parent dies.
+"""
+
+import asyncio
+import importlib
+import multiprocessing
+import os
+import threading
+import time
+from collections.abc import AsyncIterator, Callable, Iterator, MutableMapping
+from contextlib import suppress
+from dataclasses import dataclass, field
+from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
+from pathlib import Path
+from traceback import format_exc
+from typing import Any, NoReturn, Protocol
+
+from werkzeug.utils import secure_filename
+
+from aTrain_core.engine import backend_of, decode, diarize, release_memory
+from aTrain_core.jobs import JobSpec, Step
+from aTrain_core.outputs import (
+    claim_file_id,
+    make_logger,
+    read_checkpoint,
+    write_checkpoint,
+    write_final_outputs,
+)
+from aTrain_core.settings import Device, ModelKey
+
+RAW_CHECKPOINT = "raw_transcript.json"
+DIARIZED_CHECKPOINT = "diarized_transcript.json"
+WORK_LOG = "log.txt"
+POLL_INTERVAL = 0.05
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseJob:
+    """What a child needs for one job."""
+
+    spec: JobSpec
+    timestamp: str  # JobState.started_at, used as the metadata timestamp
+    work_dir: Path
+
+
+# child -> parent
+@dataclass(frozen=True, slots=True)
+class ModelLoaded:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class NextJob:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class JobProgress:
+    job_id: str
+    task: str
+    current: float
+    total: float
+
+
+@dataclass(frozen=True, slots=True)
+class JobFileId:
+    job_id: str
+    file_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class JobTranscribed:
+    job_id: str
+    audio_duration: int
+
+
+@dataclass(frozen=True, slots=True)
+class JobDone:
+    job_id: str
+    audio_duration: int
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class JobFailed:
+    job_id: str
+    step: Step
+    error: str
+    traceback: str
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseFinished:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseError:
+    error: str
+    traceback: str
+
+
+# parent -> child
+@dataclass(frozen=True, slots=True)
+class Dispatch:
+    job: PhaseJob
+
+
+@dataclass(frozen=True, slots=True)
+class NoMoreWork:
+    pass
+
+
+# made up by the parent when a child ended without PhaseFinished
+@dataclass(frozen=True, slots=True)
+class PhaseDied:
+    exitcode: int | None
+
+
+class Channel(Protocol):
+    """The child's side of the connection to the parent."""
+
+    def send(self, event: Any) -> None: ...
+    def next_job(self) -> PhaseJob | None: ...
+
+
+class PipeChannel:
+    def __init__(self, conn: Connection):
+        self._conn = conn
+
+    def send(self, event: Any) -> None:
+        self._conn.send(event)
+
+    def next_job(self) -> PhaseJob | None:
+        self._conn.send(NextJob())
+        reply = self._conn.recv()
+        return reply.job if isinstance(reply, Dispatch) else None
+
+
+class EventProgress(MutableMapping):
+    """A progress dict that the existing progress code writes to, sent to the parent as
+    JobProgress events, at most every `interval` seconds. flush() sends the last value."""
+
+    def __init__(self, channel: Channel, job_id: str, interval: float = 0.2, clock=time.monotonic):
+        self._data: dict[str, Any] = {"task": "", "current": 0, "total": 1}
+        self._channel, self._job_id = channel, job_id
+        self._interval, self._clock = interval, clock
+        self._last_sent = float("-inf")
+        self._pending = False
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        task_changed = key == "task" and value != self._data.get("task")
+        self._data[key] = value
+        self._pending = True
+        if task_changed or self._clock() - self._last_sent >= self._interval:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._pending:
+            return
+        data = self._data
+        self._channel.send(JobProgress(self._job_id, data["task"], data["current"], data["total"]))
+        self._last_sent, self._pending = self._clock(), False
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __delitem__(self, key: str) -> None:
+        del self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+class CheckpointMissingError(Exception):
+    pass
+
+
+def run_phase1(key: ModelKey, channel: Channel, load_transcriber: Callable) -> None:
+    """Load Whisper once, then transcribe the jobs the parent hands out. Jobs without
+    speaker detection also get their outputs written here."""
+    transcriber = load_transcriber(key)
+    channel.send(ModelLoaded())
+    try:
+        while (job := channel.next_job()) is not None:
+            _run_phase1_job(transcriber, job, channel)
+    finally:
+        transcriber.close()
+        release_memory(key.device)
+
+
+def _run_phase1_job(transcriber, job: PhaseJob, channel: Channel) -> None:
+    step = Step.TRANSCRIPTION
+    log = make_logger(job.work_dir / WORK_LOG)
+    try:
+        job.work_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint = read_checkpoint(job.work_dir / RAW_CHECKPOINT, job.spec.source)
+        if checkpoint is None:
+            audio, duration = decode(job.spec.source, log)
+            progress = EventProgress(channel, job.spec.id)
+            transcript = transcriber.transcribe(
+                audio,
+                language=job.spec.language,
+                initial_prompt=job.spec.initial_prompt,
+                temperature=job.spec.temperature,
+                progress=progress,
+                log=log,
+            )
+            progress.flush()
+            del audio
+            write_checkpoint(
+                job.work_dir / RAW_CHECKPOINT,
+                transcript=transcript,
+                audio_duration=duration,
+                source=job.spec.source,
+            )
+            log("Transcription successful")
+        else:
+            transcript, duration = checkpoint.transcript, checkpoint.audio_duration
+            log("Reusing the saved transcription")
+        if job.spec.speaker_detection:
+            channel.send(JobTranscribed(job.spec.id, duration))
+            return
+        step = Step.OUTPUT
+        _write_outputs(channel, job, transcript, duration, transcriber.backend)
+    except Exception as e:
+        _fail(channel, job, step, e, log)
+
+
+def run_phase2(device: Device, channel: Channel, load_diarizer: Callable) -> None:
+    """Load pyannote once, then detect speakers for the jobs the parent hands out and
+    write their outputs."""
+    pipeline = load_diarizer(device)
+    channel.send(ModelLoaded())
+    try:
+        while (job := channel.next_job()) is not None:
+            _run_phase2_job(pipeline, job, channel)
+    finally:
+        del pipeline
+        release_memory(device)
+
+
+def _run_phase2_job(pipeline, job: PhaseJob, channel: Channel) -> None:
+    step = Step.DIARIZATION
+    log = make_logger(job.work_dir / WORK_LOG)
+    try:
+        job.work_dir.mkdir(parents=True, exist_ok=True)
+        raw = read_checkpoint(job.work_dir / RAW_CHECKPOINT, job.spec.source)
+        if raw is None:
+            raise CheckpointMissingError(
+                "The saved transcription is missing, or the recording changed after it "
+                "was transcribed. Retry to transcribe it again."
+            )
+        checkpoint = read_checkpoint(job.work_dir / DIARIZED_CHECKPOINT, job.spec.source)
+        if checkpoint is None:
+            audio, _ = decode(job.spec.source, log)
+            progress = EventProgress(channel, job.spec.id)
+            transcript = diarize(
+                pipeline,
+                audio,
+                raw.transcript,
+                speaker_count=job.spec.speaker_count,
+                progress=progress,
+                log=log,
+            )
+            progress.flush()
+            del audio
+            write_checkpoint(
+                job.work_dir / DIARIZED_CHECKPOINT,
+                transcript=transcript,
+                audio_duration=raw.audio_duration,
+                source=job.spec.source,
+            )
+        else:
+            transcript = checkpoint.transcript
+            log("Reusing the saved speaker detection")
+        step = Step.OUTPUT
+        _write_outputs(channel, job, transcript, raw.audio_duration, backend_of(job.spec.model))
+    except Exception as e:
+        _fail(channel, job, step, e, log)
+
+
+def _write_outputs(channel: Channel, job: PhaseJob, transcript: dict, duration: int, backend: str):
+    file_id = claim_file_id(Path(secure_filename(job.spec.display_name)), job.timestamp)
+    channel.send(JobFileId(job.spec.id, file_id))
+    warnings = write_final_outputs(
+        job.spec.to_settings(file_id=file_id, timestamp=job.timestamp, progress={}),
+        transcript,
+        audio_duration=duration,
+        backend=backend,
+        work_log=job.work_dir / WORK_LOG,
+        export_dir=job.spec.export_dir,
+    )
+    channel.send(JobDone(job.spec.id, duration, warnings))
+
+
+def _fail(channel: Channel, job: PhaseJob, step: Step, error: Exception, log) -> None:
+    with suppress(OSError):
+        log(f"{step} failed: {error}")
+    channel.send(JobFailed(job.spec.id, step, str(error), format_exc()))
+
+
+# --- child entry points -------------------------------------------------------------
+
+
+def phase1_main(
+    key: ModelKey, conn: Connection, factory: str = "aTrain_core.engine:load_transcriber"
+) -> NoReturn:
+    _child_main(conn, lambda channel: run_phase1(key, channel, _load_factory(factory)))
+
+
+def phase2_main(
+    device: Device, conn: Connection, factory: str = "aTrain_core.engine:load_diarizer"
+) -> NoReturn:
+    _child_main(conn, lambda channel: run_phase2(device, channel, _load_factory(factory)))
+
+
+def _load_factory(path: str) -> Callable:
+    """Resolve "module:name". Tests pass fakes this way, because a spawned child can't
+    see monkeypatches."""
+    module, name = path.split(":")
+    return getattr(importlib.import_module(module), name)
+
+
+def _child_main(conn: Connection, work: Callable[[Channel], None]) -> NoReturn:
+    _start_parent_watchdog()
+    channel = PipeChannel(conn)
+    code = 0
+    try:
+        work(channel)
+        channel.send(PhaseFinished())
+    except BaseException as e:
+        code = 1
+        with suppress(Exception):
+            channel.send(PhaseError(str(e), format_exc()))
+    with suppress(Exception):
+        conn.close()
+    # Skip interpreter shutdown: faster-whisper can hang there
+    # (https://github.com/guillaumekln/faster-whisper/issues/71).
+    os._exit(code)
+
+
+def _start_parent_watchdog() -> None:
+    """Exit when the parent is gone (crash, force-quit), so no child keeps the GPU."""
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+
+    def watch() -> None:
+        parent.join()
+        os._exit(3)
+
+    threading.Thread(target=watch, name="parent-watchdog", daemon=True).start()
+
+
+# --- parent side ----------------------------------------------------------------------
+
+
+class PhaseHandle:
+    """The parent's side of one phase child."""
+
+    def __init__(self, process: BaseProcess, conn: Connection):
+        self.process = process
+        self.conn = conn
+
+    async def events(self) -> AsyncIterator[Any]:
+        """Yield the child's events in order, including NextJob (answer with reply()).
+        After the child has ended, yields PhaseDied unless it sent PhaseFinished."""
+        finished = False
+        while True:
+            alive = self.process.is_alive()
+            for event in self._drain():
+                finished = finished or isinstance(event, PhaseFinished)
+                yield event
+            if not alive:
+                break
+            await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.to_thread(self.process.join)
+        if not finished:
+            yield PhaseDied(self.process.exitcode)
+
+    def _drain(self) -> Iterator[Any]:
+        try:
+            while self.conn.poll():
+                yield self.conn.recv()
+        except (EOFError, OSError):
+            return
+
+    def reply(self, answer: Dispatch | NoMoreWork) -> None:
+        with suppress(OSError):  # the child may have died meanwhile
+            self.conn.send(answer)
+
+    def kill(self) -> None:
+        self.process.kill()
+        self.process.join(5)
+
+
+def launch_phase1(key: ModelKey, factory: str | None = None) -> PhaseHandle:
+    return _launch(phase1_main, key, factory, "aTrain phase 1")
+
+
+def launch_phase2(device: Device, factory: str | None = None) -> PhaseHandle:
+    return _launch(phase2_main, device, factory, "aTrain phase 2")
+
+
+def _launch(target, arg, factory: str | None, name: str) -> PhaseHandle:
+    # spawn on every platform: no inherited CUDA state and nothing copied from the GUI
+    context = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = context.Pipe(duplex=True)
+    args = (arg, child_conn) if factory is None else (arg, child_conn, factory)
+    process = context.Process(target=target, args=args, name=name, daemon=False)
+    process.start()
+    child_conn.close()  # so the parent sees EOF when the child ends
+    return PhaseHandle(process, parent_conn)

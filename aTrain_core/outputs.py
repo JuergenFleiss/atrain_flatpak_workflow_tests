@@ -252,11 +252,18 @@ class Checkpoint:
     audio_duration: int
 
 
-def write_checkpoint(path: Path, *, transcript: dict, audio_duration: int, source: Path) -> None:
+def write_checkpoint(
+    path: Path,
+    *,
+    transcript: dict,
+    audio_duration: int,
+    source: Path,
+    source_stat: os.stat_result | None = None,
+) -> None:
     """Save a word-level transcript atomically, tied to the size and modification time
-    of the source it was made from."""
+    of the source it was made from (`source_stat`, taken before decoding; default: now)."""
 
-    stat = os.stat(source)
+    stat = source_stat or os.stat(source)
     data = {
         "source_size": stat.st_size,
         "source_mtime_ns": stat.st_mtime_ns,
@@ -272,13 +279,16 @@ def write_checkpoint(path: Path, *, transcript: dict, audio_duration: int, sourc
     os.replace(tmp, path)
 
 
-def read_checkpoint(path: Path, source: Path) -> Checkpoint | None:
+def read_checkpoint(
+    path: Path, source: Path, source_stat: os.stat_result | None = None
+) -> Checkpoint | None:
     """Return the saved transcript, or None if the file is missing or damaged, or the
-    source is gone or has changed since the checkpoint was written."""
+    source is gone or has changed since the checkpoint was written. Compares against
+    `source_stat` if given, else against the source now."""
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        stat = os.stat(source)
+        stat = source_stat or os.stat(source)
         if (data["source_size"], data["source_mtime_ns"]) != (stat.st_size, stat.st_mtime_ns):
             return None
         return Checkpoint(data["transcript"], data["audio_duration"])

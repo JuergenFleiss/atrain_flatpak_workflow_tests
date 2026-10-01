@@ -175,3 +175,21 @@ def test_checkpoint_invalid_cases(tmp_path, source):
     outputs.write_checkpoint(path, transcript=transcript(False), audio_duration=5, source=source)
     source.unlink()  # gone
     assert outputs.read_checkpoint(path, source) is None
+
+
+def test_checkpoint_is_tied_to_the_given_source_stat(tmp_path, source):
+    """A checkpoint of audio decoded earlier is tied to the source as it was then."""
+    path = tmp_path / "raw_transcript.json"
+    decoded_from = source.stat()
+    source.write_bytes(b"other audio")  # replaced while the old audio was transcribed
+
+    outputs.write_checkpoint(
+        path,
+        transcript=transcript(False),
+        audio_duration=5,
+        source=source,
+        source_stat=decoded_from,
+    )
+
+    assert outputs.read_checkpoint(path, source) is None
+    assert outputs.read_checkpoint(path, source, source_stat=decoded_from) is not None

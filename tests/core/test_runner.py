@@ -39,7 +39,7 @@ class FakeTranscriber:
     backend = "faster-whisper"
 
     def __init__(self, fail_on=()):
-        self.calls, self.fail_on, self.closed = [], set(fail_on), False
+        self.calls, self.fail_on = [], set(fail_on)
 
     def transcribe(self, audio, *, language, initial_prompt, temperature, progress, log):
         self.calls.append(language)
@@ -53,16 +53,12 @@ class FakeTranscriber:
         ]
         return {"segments": words_to_segments(words)}
 
-    def close(self):
-        self.closed = True
-
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """Archive in tmp, fake decode and fake diarize (every word gets SPEAKER_00)."""
     monkeypatch.setattr(outputs, "TRANSCRIPT_DIR", tmp_path / "transcriptions")
     monkeypatch.setattr(runner, "decode", lambda source, log: (np.zeros(16000, np.float32), 1))
-    monkeypatch.setattr(runner, "release_memory", lambda device: None)
     diarized = []
 
     def fake_diarize(pipeline, audio, transcript, *, speaker_count, progress, log):
@@ -93,7 +89,7 @@ def test_phase1_loads_once_and_stops_at_no_more_work(env):
 
     runner.run_phase1(KEY, channel, lambda key: loads.append(key) or transcriber)
 
-    assert loads == [KEY] and transcriber.closed
+    assert loads == [KEY]
     assert isinstance(channel.events[0], runner.ModelLoaded)
     assert [e.job_id for e in channel.of(runner.JobDone)] == ["a", "b"]
     assert len(channel.jobs) == 1
@@ -202,6 +198,46 @@ def test_phase2_with_changed_source_fails_without_diarizing(env):
     failed = channel.of(runner.JobFailed)[0]
     assert failed.step == Step.DIARIZATION and "recording changed" in failed.error
     assert diarized == []
+
+
+def test_source_replaced_during_transcription_is_not_diarized(env):
+    tmp_path, diarized = env
+    job = make_job(tmp_path, "a")
+
+    class ReplacingTranscriber(FakeTranscriber):
+        def transcribe(self, audio, **kwargs):
+            Path(job.spec.source).write_bytes(b"another recording")
+            return super().transcribe(audio, **kwargs)
+
+    runner.run_phase1(KEY, FakeChannel([job]), lambda key: ReplacingTranscriber())
+    channel = FakeChannel([job])
+    runner.run_phase2(Device.CPU, channel, lambda device: "pipeline")
+
+    assert "recording changed" in channel.of(runner.JobFailed)[0].error
+    assert diarized == []
+
+
+@pytest.mark.parametrize("phase", [1, 2])
+def test_source_changed_while_decoding_fails_the_job(env, monkeypatch, phase):
+    tmp_path, diarized = env
+    job = make_job(tmp_path, "a")
+    if phase == 2:
+        runner.run_phase1(KEY, FakeChannel([job]), lambda key: FakeTranscriber())
+
+    def decode_while_replaced(source, log):
+        Path(source).write_bytes(b"another recording")
+        return np.zeros(16000, np.float32), 1
+
+    monkeypatch.setattr(runner, "decode", decode_while_replaced)
+    transcriber, channel = FakeTranscriber(), FakeChannel([job])
+    if phase == 1:
+        runner.run_phase1(KEY, channel, lambda key: transcriber)
+    else:
+        runner.run_phase2(Device.CPU, channel, lambda device: "pipeline")
+
+    failed = channel.of(runner.JobFailed)[0]
+    assert "changed while it was read" in failed.error
+    assert transcriber.calls == [] and diarized == []
 
 
 def test_event_progress_throttles_and_flushes_the_last_value():

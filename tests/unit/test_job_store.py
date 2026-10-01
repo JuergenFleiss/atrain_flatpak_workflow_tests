@@ -96,3 +96,28 @@ def test_clear_finished_keeps_active_jobs(tmp_path):
 
     assert store.clear_finished() == ["a", "b"]
     assert ids(store) == ["c", "d"]
+
+
+def test_clear_finished_saves_once_and_deletes_work_folders(tmp_path, monkeypatch):
+    store = JobStore(tmp_path)
+    store.add([make_spec(id=job_id, speaker_detection=False) for job_id in "abc"])
+    for job_id in "ab":
+        store.update(job_id, status=JobStatus.CANCELLED)
+        store.work_dir(job_id).mkdir(parents=True)
+    saves = []
+    monkeypatch.setattr(store, "_save", lambda: saves.append(ids(store)))
+
+    store.clear_finished()
+
+    assert saves == [["c"]]
+    assert not store.work_dir("a").exists() and not store.work_dir("b").exists()
+
+
+def test_reload_reads_what_another_store_saved(tmp_path):
+    store = JobStore(tmp_path)
+    store.add([make_spec(id="a", speaker_detection=False)])
+    JobStore(tmp_path).update("a", status=JobStatus.TRANSCRIBING)
+
+    store.reload()
+
+    assert store.get("a")[1].status == JobStatus.TRANSCRIBING

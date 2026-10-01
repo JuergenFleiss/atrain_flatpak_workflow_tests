@@ -197,6 +197,10 @@ class JobStore:
         self.uploads_root = root / "uploads"
         self._jobs: list[tuple[JobSpec, JobState]] = self._load()
 
+    def reload(self) -> None:
+        """Read queue.json again, e.g. after taking the queue lock."""
+        self._jobs = self._load()
+
     def add(self, specs: list[JobSpec]) -> None:
         known = {spec.id for spec, _ in self._jobs}
         for spec in specs:
@@ -235,14 +239,19 @@ class JobStore:
         A source outside queue/uploads/ is never touched."""
         del self._jobs[self._index(job_id)]
         self._save()
-        shutil.rmtree(self.work_dir(job_id), ignore_errors=True)
-        shutil.rmtree(self.uploads_root / job_id, ignore_errors=True)
+        self._delete_files(job_id)
 
     def clear_finished(self) -> list[str]:
         finished = [spec.id for spec, state in self._jobs if state.status in FINAL_STATUSES]
+        self._jobs = [job for job in self._jobs if job[1].status not in FINAL_STATUSES]
+        self._save()
         for job_id in finished:
-            self.remove(job_id)
+            self._delete_files(job_id)
         return finished
+
+    def _delete_files(self, job_id: str) -> None:
+        shutil.rmtree(self.work_dir(job_id), ignore_errors=True)
+        shutil.rmtree(self.uploads_root / job_id, ignore_errors=True)
 
     def work_dir(self, job_id: str) -> Path:
         return self.work_root / job_id

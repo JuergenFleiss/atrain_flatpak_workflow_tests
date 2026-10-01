@@ -6,7 +6,7 @@ import sys
 
 import pytest
 from aTrain_core import outputs
-from aTrain_core.jobs import JobStatus, JobStore, QueueLockedError, Step
+from aTrain_core.jobs import JobStatus, JobStore, QueueLock, QueueLockedError, Step
 from aTrain_core.queue_service import QueueService
 from aTrain_core.runner import (
     RAW_CHECKPOINT,
@@ -100,9 +100,12 @@ class FakeLauncher:
         self.outcomes: dict[str, str] = {}
         self.gates: dict[str, asyncio.Event] = {}
         self.load_crash_models: set[str] = set()
+        self.launch_error_models: set[str] = set()
 
     def launch(self, phase):
         def launch(arg):
+            if phase == 1 and arg.model in self.launch_error_models:
+                raise OSError("cannot start the process")
             self.launches.append((phase, arg))
             handle = FakeHandle(self, phase, arg)
             self.handles.append(handle)
@@ -274,6 +277,41 @@ async def test_interrupted_output_writing_leaves_no_archive_folder(started):
     assert not (outputs.TRANSCRIPT_DIR / "partial").exists() and store.get("a")[1].file_id is None
 
 
+async def test_cancel_while_the_transcript_is_on_its_way(started):
+    tmp_path, store, service, launcher = started
+    launcher.gates["a"] = asyncio.Event()
+    service.enqueue([spec(tmp_path, "a", speaker_detection=True)])
+    await until(lambda: launcher.dispatched() == ["a"])
+
+    await service.cancel(["a"])  # the kill is requested while the job is in flight...
+    launcher.gates["a"].set()  # ...but JobTranscribed was already on its way
+    await settle(service)
+
+    assert status(store, "a") == JobStatus.CANCELLED and not store.get("a")[1].cancelling
+    assert [phase for phase, _ in launcher.launches] == [1]
+    service.retry("a")  # keeps the transcription
+    await settle(service)
+    assert status(store, "a") == JobStatus.DONE
+    assert [phase for phase, _ in launcher.launches] == [1, 2]
+
+
+async def test_pause_during_transcription_does_not_start_phase_2(started):
+    tmp_path, store, service, launcher = started
+    launcher.gates["a"] = asyncio.Event()
+    service.enqueue([spec(tmp_path, "a", speaker_detection=True)])
+    await until(lambda: launcher.dispatched() == ["a"])
+
+    service.pause()
+    launcher.gates["a"].set()
+    await until(lambda: status(store, "a") == JobStatus.TRANSCRIBED)
+    await asyncio.sleep(0.1)
+    assert [phase for phase, _ in launcher.launches] == [1]
+
+    service.resume()
+    await settle(service)
+    assert status(store, "a") == JobStatus.DONE
+
+
 async def test_pause_and_resume(started):
     tmp_path, store, service, launcher = started
     service.pause()
@@ -386,6 +424,38 @@ async def test_status_bug_fails_only_that_job(started):
     assert status(store, "b") == JobStatus.DONE
 
 
+async def test_failed_save_when_handing_out_a_job_fails_only_that_job(started, monkeypatch):
+    tmp_path, store, service, _launcher = started
+    service.pause()
+    service.enqueue([spec(tmp_path, "a"), spec(tmp_path, "b")])
+    save, failures = store._save, []
+
+    def flaky_save():
+        if store.get("a")[1].status == JobStatus.TRANSCRIBING and not failures:
+            failures.append(True)
+            raise OSError("disk full")
+        save()
+
+    monkeypatch.setattr(store, "_save", flaky_save)
+    service.resume()
+    await settle(service)
+
+    assert store.get("a")[1].error == "Internal error: disk full"
+    assert status(store, "b") == JobStatus.DONE
+
+
+async def test_launch_error_fails_the_group_only(started):
+    tmp_path, store, service, launcher = started
+    launcher.launch_error_models.add("large-v3-turbo")
+    service.pause()
+    service.enqueue([spec(tmp_path, "a"), spec(tmp_path, "b", model="small")])
+    service.resume()
+    await settle(service)
+
+    assert "cannot start the process" in store.get("a")[1].error
+    assert status(store, "b") == JobStatus.DONE
+
+
 async def test_recovery_after_a_restart(env):
     tmp_path, store, service, _launcher = env
     store.add(
@@ -433,6 +503,42 @@ async def test_stop_puts_the_running_job_back(env):
     second = QueueService(store)
     second._lock.acquire()  # the lock was released
     second._lock.release()
+
+
+async def test_stop_releases_the_lock_after_a_scheduler_error(env, monkeypatch):
+    _tmp_path, store, service, _launcher = env
+
+    def broken():
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(service, "_head", broken)
+    await service.start()
+    await until(lambda: service._scheduler_task.done())
+
+    with pytest.raises(RuntimeError):
+        await service.stop()
+    with QueueLock(store.root):  # the lock was released
+        pass
+
+
+async def test_start_reads_the_queue_under_the_lock(env):
+    """A store loaded before another aTrain finished a job must not undo that job."""
+    tmp_path, store, _service, launcher = env
+    store.add([spec(tmp_path, "a")])
+    store.update("a", status=JobStatus.TRANSCRIBING, file_id="a-archive")
+    (outputs.TRANSCRIPT_DIR / "a-archive").mkdir(parents=True)
+    stale = JobStore(store.root)
+    store.update("a", status=JobStatus.DONE)  # the other aTrain finishes and quits
+    service = QueueService(
+        stale, launch_phase1=launcher.launch(1), launch_phase2=launcher.launch(2)
+    )
+
+    await service.start()
+    try:
+        assert status(stale, "a") == JobStatus.DONE
+        assert (outputs.TRANSCRIPT_DIR / "a-archive").is_dir()
+    finally:
+        await service.stop()
 
 
 HOLD_LOCK = """

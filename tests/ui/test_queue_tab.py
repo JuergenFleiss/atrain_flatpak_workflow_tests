@@ -214,4 +214,4 @@ async def test_one_file_goes_to_the_queue_without_a_dialog(service, tmp_path, us
 
     assert [spec.display_name for spec, _ in service.jobs()] == ["one.mp3"]
     await user.should_see("one.mp3 added to the queue")
-    user.should_not_see(kind=ui.dialog)
+    await user.should_not_see(kind=ui.dialog)

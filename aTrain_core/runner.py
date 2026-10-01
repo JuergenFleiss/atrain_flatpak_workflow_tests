@@ -23,7 +23,7 @@ from typing import Any, NoReturn, Protocol
 
 from werkzeug.utils import secure_filename
 
-from aTrain_core.engine import backend_of, decode, diarize, release_memory
+from aTrain_core.engine import backend_of, decode, diarize
 from aTrain_core.jobs import JobSpec, Step
 from aTrain_core.outputs import (
     claim_file_id,
@@ -185,17 +185,30 @@ class CheckpointMissingError(Exception):
     pass
 
 
+class SourceChangedError(Exception):
+    pass
+
+
+def _decode_unchanged(source: Path, source_stat: os.stat_result, log):
+    """Decode the source; fail if it changed since `source_stat` was taken, because the
+    checkpoints made from this audio are tied to `source_stat`."""
+    audio, duration = decode(source, log)
+    now = os.stat(source)
+    if (now.st_size, now.st_mtime_ns) != (source_stat.st_size, source_stat.st_mtime_ns):
+        raise SourceChangedError(
+            "The recording changed while it was read. Retry to transcribe it again."
+        )
+    return audio, duration
+
+
 def run_phase1(key: ModelKey, channel: Channel, load_transcriber: Callable) -> None:
     """Load Whisper once, then transcribe the jobs the parent hands out. Jobs without
     speaker detection also get their outputs written here."""
     transcriber = load_transcriber(key)
     channel.send(ModelLoaded())
-    try:
-        while (job := channel.next_job()) is not None:
-            _run_phase1_job(transcriber, job, channel)
-    finally:
-        transcriber.close()
-        release_memory(key.device)
+    # no cleanup afterwards: the child ends with os._exit, which frees everything
+    while (job := channel.next_job()) is not None:
+        _run_phase1_job(transcriber, job, channel)
 
 
 def _run_phase1_job(transcriber, job: PhaseJob, channel: Channel) -> None:
@@ -205,7 +218,8 @@ def _run_phase1_job(transcriber, job: PhaseJob, channel: Channel) -> None:
         job.work_dir.mkdir(parents=True, exist_ok=True)
         checkpoint = read_checkpoint(job.work_dir / RAW_CHECKPOINT, job.spec.source)
         if checkpoint is None:
-            audio, duration = decode(job.spec.source, log)
+            source_stat = os.stat(job.spec.source)
+            audio, duration = _decode_unchanged(job.spec.source, source_stat, log)
             progress = EventProgress(channel, job.spec.id)
             transcript = transcriber.transcribe(
                 audio,
@@ -222,6 +236,7 @@ def _run_phase1_job(transcriber, job: PhaseJob, channel: Channel) -> None:
                 transcript=transcript,
                 audio_duration=duration,
                 source=job.spec.source,
+                source_stat=source_stat,
             )
             log("Transcription successful")
         else:
@@ -241,12 +256,9 @@ def run_phase2(device: Device, channel: Channel, load_diarizer: Callable) -> Non
     write their outputs."""
     pipeline = load_diarizer(device)
     channel.send(ModelLoaded())
-    try:
-        while (job := channel.next_job()) is not None:
-            _run_phase2_job(pipeline, job, channel)
-    finally:
-        del pipeline
-        release_memory(device)
+    # no cleanup afterwards: the child ends with os._exit, which frees everything
+    while (job := channel.next_job()) is not None:
+        _run_phase2_job(pipeline, job, channel)
 
 
 def _run_phase2_job(pipeline, job: PhaseJob, channel: Channel) -> None:
@@ -254,15 +266,18 @@ def _run_phase2_job(pipeline, job: PhaseJob, channel: Channel) -> None:
     log = make_logger(job.work_dir / WORK_LOG)
     try:
         job.work_dir.mkdir(parents=True, exist_ok=True)
-        raw = read_checkpoint(job.work_dir / RAW_CHECKPOINT, job.spec.source)
+        source_stat = os.stat(job.spec.source)
+        raw = read_checkpoint(job.work_dir / RAW_CHECKPOINT, job.spec.source, source_stat)
         if raw is None:
             raise CheckpointMissingError(
                 "The saved transcription is missing, or the recording changed after it "
                 "was transcribed. Retry to transcribe it again."
             )
-        checkpoint = read_checkpoint(job.work_dir / DIARIZED_CHECKPOINT, job.spec.source)
+        checkpoint = read_checkpoint(
+            job.work_dir / DIARIZED_CHECKPOINT, job.spec.source, source_stat
+        )
         if checkpoint is None:
-            audio, _ = decode(job.spec.source, log)
+            audio, _ = _decode_unchanged(job.spec.source, source_stat, log)
             progress = EventProgress(channel, job.spec.id)
             transcript = diarize(
                 pipeline,
@@ -279,6 +294,7 @@ def _run_phase2_job(pipeline, job: PhaseJob, channel: Channel) -> None:
                 transcript=transcript,
                 audio_duration=raw.audio_duration,
                 source=job.spec.source,
+                source_stat=source_stat,
             )
         else:
             transcript = checkpoint.transcript

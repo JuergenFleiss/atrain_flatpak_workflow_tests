@@ -5,7 +5,6 @@ torch, faster_whisper, pyannote and crisperwhisper are imported inside functions
 module stays cheap to import (for example in a freshly spawned child process).
 """
 
-import gc
 import sys
 import warnings
 from collections.abc import Callable, MutableMapping
@@ -247,13 +246,3 @@ def _progress_hook(progress: MutableMapping):
                 self._progress["current"] = (completed / total + 1) * self.grand_total / 2
 
     return CustomProgressHook(progress)
-
-
-def release_memory(device: Device) -> None:
-    """Free memory of models that are no longer referenced."""
-    gc.collect()
-    if device == Device.GPU:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()

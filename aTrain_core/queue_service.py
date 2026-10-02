@@ -172,6 +172,7 @@ class QueueService:
             started_at = self.store.get(spec.id)[1].started_at or _now()
             running = JobStatus.TRANSCRIBING if phase == 1 else JobStatus.DIARIZING
             self.store.update(spec.id, status=running, started_at=started_at)
+            self.store.get(spec.id)[1].progress = 0.0  # each phase reports from 0
             self._in_flight = spec.id
             job = PhaseJob(spec, started_at, self.store.work_dir(spec.id))
             self._handle = self._launch[phase](job)

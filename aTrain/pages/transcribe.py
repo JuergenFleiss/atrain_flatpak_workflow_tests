@@ -1,5 +1,5 @@
-from aTrain.components.queue_view import queue_view
-from aTrain.components.settings.advanced import advanced_settings
+from aTrain.components.queue_status import queue_status
+from aTrain.components.settings.advanced import seed_defaults
 from aTrain.components.settings.file import input_file
 from aTrain.components.settings.language import input_language
 from aTrain.components.settings.model import input_model
@@ -27,10 +27,20 @@ async def page(client: Client):
     except QueueLockedError:
         service = None
     locked = service is None
-    # The queue sits below the settings, so jobs can be followed while more are added.
-    with base_layout(below=None if locked else lambda: queue_view(service)):
+    seed_defaults()
+    with base_layout():
         if locked:
             ui.label(queue_ui.LOCKED_TEXT).classes("w-full p-3 bg-amber-100 text-dark rounded")
+        portal = (FLATPAK or LINUX) and app.native.main_window is not None
+
+        async def start():
+            if file.selected_paths:  # picked files or a folder on disk
+                await start_paths(file.selected_paths, file.export_dir)
+            elif portal or file.mode.value == "Folder":
+                ui.notify("Please select a file or a folder with files first", color="negative")
+            else:
+                file.upload()  # browser upload; start_uploads runs when it's done
+
         with ui.element("div").classes(
             "w-full h-full grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-10"
         ):
@@ -39,27 +49,16 @@ async def page(client: Client):
             input_language()
             input_speaker_detection()
             input_speaker_count()
-        ui.separator().classes("mt-4")
-        with ui.row().classes("w-full justify-between items-center"):
-            settings_btn = ui.button("Advanced Settings", color="gray-100").mark(
-                "open_advanced_settings"
-            )
-            settings_btn.props("size=0.8rem unelevated no-caps icon=settings")
-            portal = (FLATPAK or LINUX) and app.native.main_window is not None
-
-            async def start():
-                if file.selected_paths:  # picked files or a folder on disk
-                    await start_paths(file.selected_paths, file.export_dir)
-                elif portal or file.mode.value == "Folder":
-                    ui.notify("Please select a file or a folder with files first", color="negative")
-                else:
-                    file.upload()  # browser upload; start_uploads runs when it's done
-
-            start_btn = ui.button("Start", on_click=start, color="dark")
-            start_btn.props("no-caps unelevated")
+            # third column even while Number of Speakers is hidden
+            with ui.element("div").classes(
+                "self-stretch flex items-end justify-end lg:col-start-3"
+            ):
+                start_btn = ui.button("Start", on_click=start, color="dark")
+                start_btn.props("no-caps unelevated")
             if locked:
                 start_btn.disable()
-            advanced_settings(open=False)
+        ui.separator().classes("mt-4")
+        if not locked:
+            queue_status(service, start_btn)
 
     file.on_multi_upload(start_uploads)
-    settings_btn.on_click(lambda: advanced_settings(open=True))

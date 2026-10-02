@@ -260,6 +260,24 @@ async def test_cancel_while_the_transcript_is_on_its_way(started):
     assert [phase for phase, _ in launcher.launches] == [1, 2]
 
 
+async def test_progress_starts_at_zero_in_each_phase(started):
+    tmp_path, store, service, launcher = started
+    service.pause()
+    service.enqueue([spec(tmp_path, "a", speaker_detection=True)])
+    store.update("a", status=JobStatus.TRANSCRIBING)
+    store.update("a", status=JobStatus.TRANSCRIBED)
+    store.get("a")[1].progress = 0.99  # left over from the transcription
+    launcher.gates["a"] = asyncio.Event()
+
+    service.resume()
+    await until(lambda: launcher.dispatched() == ["a"])
+    seen = (status(store, "a"), store.get("a")[1].progress)
+    launcher.gates["a"].set()  # before asserting, so a failure can't hang the teardown
+    await settle(service)
+
+    assert seen == (JobStatus.DIARIZING, 0.0)
+
+
 async def test_pause_during_transcription_does_not_start_phase_2(started):
     tmp_path, store, service, launcher = started
     launcher.gates["a"] = asyncio.Event()

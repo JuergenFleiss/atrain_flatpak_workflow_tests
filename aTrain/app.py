@@ -51,7 +51,15 @@ def start(
         with patch.dict(os.environ, NICEGUI_STORAGE_PATH=str(nicegui_storage_path)):
             from nicegui import app, background_tasks, run, ui
 
-            from aTrain.pages import about, archive, faq, models, queue_tab, transcribe  # noqa
+            from aTrain.pages import (  # noqa
+                about,
+                advanced,
+                archive,
+                faq,
+                models,
+                queue_tab,
+                transcribe,
+            )
         from wakepy import keep
     except ImportError as e:
         sys.exit(

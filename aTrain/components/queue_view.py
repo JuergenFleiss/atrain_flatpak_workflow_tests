@@ -1,4 +1,4 @@
-"""The queue list with its buttons: used by the Queue tab and below the transcribe page."""
+"""The queue list with its buttons, shown on the Queue tab."""
 
 import inspect
 

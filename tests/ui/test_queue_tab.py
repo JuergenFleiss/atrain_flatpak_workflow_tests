@@ -198,10 +198,77 @@ def test_folder_summary(tmp_path):
     assert lines[1:] == ["a.mp3", "b.mp3", "c.mp3", "d.mp3", "e.mp3", "and 1 more"]
 
 
-async def test_transcribe_page_shows_the_queue_below_the_settings(service, user: User):
+async def test_transcribe_page_hides_the_status_panel_while_the_queue_is_empty(service, user: User):
     await user.open("/")
-    await user.should_see("Advanced Settings", retries=200)
-    await user.should_see("The queue is empty.")
+    await user.should_see(kind=ui.button, content="Start", retries=200)
+    await user.should_not_see("The queue is empty.")  # the list is only on the Queue tab
+    await user.should_not_see(marker="queue_status")
+
+
+async def test_status_panel_shows_the_running_job(service, tmp_path, user: User):
+    add(service, tmp_path, "done", S.TRANSCRIBING, S.DONE)
+    add(service, tmp_path, "running", S.TRANSCRIBING)
+    add(service, tmp_path, "queued")
+    service.store.get("running")[1].progress = 0.62
+
+    await user.open("/")
+
+    for text in ("Step 1/1:", "Transcribing", "running.mp3", "62%", "Running on CPU"):
+        await user.should_see(text, retries=200)
+    await user.should_see("Job 2 of 3 · 1 waiting")
+    await user.should_see("Add to queue")  # the button says "Start" only for the first job
+    await user.should_see("View queue")
+    await user.should_see("Stop")
+
+
+@pytest.mark.parametrize(
+    ("statuses", "task", "percent"),
+    [
+        ((S.TRANSCRIBING, S.TRANSCRIBED), "Detecting speakers", "0%"),
+        ((S.TRANSCRIBING, S.TRANSCRIBED, S.DIARIZING), "Detecting speakers", "40%"),
+    ],
+)
+async def test_status_panel_shows_speaker_detection(
+    service, tmp_path, user: User, statuses, task, percent
+):
+    add(service, tmp_path, "a", *statuses, speaker_detection=True)
+    service.store.get("a")[1].progress = 0.4
+
+    await user.open("/")
+
+    for text in ("Step 2/2:", task, percent, "Job 1 of 1 · 0 waiting"):
+        await user.should_see(text, retries=200)
+
+
+async def test_status_panel_while_paused(service, tmp_path, user: User):
+    add(service, tmp_path, "queued")
+
+    await user.open("/")
+
+    await user.should_see("Paused", retries=200)
+    await user.should_see("Job 1 of 1 · 1 waiting")
+    await user.should_not_see("Stop")
+
+
+async def test_status_panel_hides_when_every_job_is_finished(service, tmp_path, user: User):
+    add(service, tmp_path, "done", S.TRANSCRIBING, S.DONE)
+    add(service, tmp_path, "failed", S.FAILED)
+
+    await user.open("/")
+
+    await user.should_see(kind=ui.button, content="Start", retries=200)
+    await user.should_not_see(marker="queue_status")
+
+
+async def test_locked_queue_disables_start(monkeypatch, user: User):
+    async def locked():
+        raise QueueLockedError("held")
+
+    monkeypatch.setattr(queue_ui, "get_queue_service", locked)
+    await user.open("/")
+    await user.should_see(queue_ui.LOCKED_TEXT, retries=200)
+    assert not user.find(kind=ui.button, content="Start").elements.pop().enabled
+    await user.should_not_see(marker="queue_status")
 
 
 async def test_one_file_goes_to_the_queue_without_a_dialog(service, tmp_path, user: User):

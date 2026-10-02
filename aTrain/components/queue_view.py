@@ -4,20 +4,20 @@ import inspect
 
 from aTrain.components.dialogs.error import dialog_error
 from aTrain.utils.archive import download_file_directory, open_file_directory
+from aTrain_core.jobs import FINAL_STATUSES, JobStatus
 from nicegui import app, ui
 
 STATUS_TEXT = {
-    "queued": "Queued",
-    "transcribing": "Transcribing",
-    "transcribed": "Waiting for speaker detection",
-    "diarizing": "Detecting speakers",
-    "done": "Done",
-    "failed": "Failed",
-    "cancelled": "Cancelled",
+    JobStatus.QUEUED: "Queued",
+    JobStatus.TRANSCRIBING: "Transcribing",
+    JobStatus.TRANSCRIBED: "Waiting for speaker detection",
+    JobStatus.DIARIZING: "Detecting speakers",
+    JobStatus.DONE: "Done",
+    JobStatus.FAILED: "Failed",
+    JobStatus.CANCELLED: "Cancelled",
 }
-RUNNING = {"transcribing", "diarizing"}
-WAITING = {"queued", "transcribed"}
-FINAL = {"done", "failed", "cancelled"}
+RUNNING = {JobStatus.TRANSCRIBING, JobStatus.DIARIZING}
+WAITING = {JobStatus.QUEUED, JobStatus.TRANSCRIBED}
 COLUMNS = "minmax(0, 2fr) minmax(0, 2fr) minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1.2fr)"
 
 
@@ -58,8 +58,8 @@ def queue_view(service) -> None:
         nonlocal last_signature
         jobs = service.jobs()
         pause.text = "Resume" if service.paused else "Pause"
-        cancel_all.set_enabled(any(state.status not in FINAL for _, state in jobs))
-        clear.set_enabled(any(state.status in FINAL for _, state in jobs))
+        cancel_all.set_enabled(any(state.status not in FINAL_STATUSES for _, state in jobs))
+        clear.set_enabled(any(state.status in FINAL_STATUSES for _, state in jobs))
         signature = [
             (spec.id, state.status, state.cancelling, tuple(state.warnings)) for spec, state in jobs
         ]
@@ -75,7 +75,7 @@ def queue_view(service) -> None:
 
 
 def job_row(service, spec, state, progress_bars: dict, refresh) -> None:
-    status = str(state.status)
+    status = state.status
     with ui.item().classes("hover:bg-gray-100"):
         with ui.grid(columns=COLUMNS).classes("w-full items-center"):
             ui.label(spec.display_name).classes("font-light truncate")
@@ -87,12 +87,12 @@ def job_row(service, spec, state, progress_bars: dict, refresh) -> None:
                 bar.classes("invisible")  # keeps its grid cell, so Actions stay in their column
             progress_bars[spec.id] = bar
             with ui.row().classes("gap-1 items-center"):
-                if status == "done":
+                if status == JobStatus.DONE:
                     native = app.native.main_window is not None
                     action_button(
                         "open" if native else "download", lambda: open_result(state.file_id)
                     )
-                if status in {"failed", "cancelled"}:
+                if status in {JobStatus.FAILED, JobStatus.CANCELLED}:
                     action_button("retry", lambda: (service.retry(spec.id), refresh()))
                 if status in WAITING:
                     action_button("↑", lambda: (service.move(spec.id, -1), refresh()))
@@ -101,9 +101,9 @@ def job_row(service, spec, state, progress_bars: dict, refresh) -> None:
                     action_button("✕", lambda: confirm_remove(service, spec, status, refresh))
 
 
-def status_label(state, status: str) -> None:
+def status_label(state, status: JobStatus) -> None:
     text = "Cancelling…" if state.cancelling else STATUS_TEXT.get(status, status)
-    if status == "done" and state.warnings:
+    if status == JobStatus.DONE and state.warnings:
         ui.button(
             "Done with warnings",
             icon="warning",
@@ -111,7 +111,7 @@ def status_label(state, status: str) -> None:
             on_click=lambda: show_warnings(state.warnings),
         ).props("flat dense no-caps")
         return
-    if status != "failed":
+    if status != JobStatus.FAILED:
         ui.label(text).classes("font-light")
         return
     label = ui.label(f"{text} ⓘ").classes("font-light text-red-700 cursor-pointer")
@@ -185,13 +185,13 @@ def confirm(text: str, action, refresh) -> None:
             )
 
 
-def confirm_remove(service, spec, status: str, refresh) -> None:
+def confirm_remove(service, spec, status: JobStatus, refresh) -> None:
     name = spec.display_name
     if status in RUNNING:
         confirm(f"Stop transcribing {name}?", lambda: service.cancel([spec.id]), refresh)
         return
     text = f"Remove {name} from the queue?"
-    if status == "done":
+    if status == JobStatus.DONE:
         text = f"Remove {name}? The transcript stays in the archive."
     if (service.store.uploads_root / spec.id).exists():
         text += "\nThe uploaded file will be deleted."
@@ -199,12 +199,12 @@ def confirm_remove(service, spec, status: str, refresh) -> None:
 
 
 def confirm_cancel_all(service, refresh) -> None:
-    ids = [spec.id for spec, state in service.jobs() if str(state.status) not in FINAL]
+    ids = [spec.id for spec, state in service.jobs() if state.status not in FINAL_STATUSES]
     confirm(f"Stop all {len(ids)} unfinished jobs?", lambda: service.cancel(ids), refresh)
 
 
 def confirm_clear_finished(service, refresh) -> None:
-    finished = [spec for spec, state in service.jobs() if str(state.status) in FINAL]
+    finished = [spec for spec, state in service.jobs() if state.status in FINAL_STATUSES]
     uploads = sum((service.store.uploads_root / spec.id).exists() for spec in finished)
     text = f"Remove {len(finished)} finished, failed or cancelled jobs from the queue?"
     if uploads:

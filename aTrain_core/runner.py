@@ -166,18 +166,19 @@ def _decode_unchanged(source: Path, source_stat: os.stat_result, log):
 
 def run_phase1(job: PhaseJob, channel: Channel, load_transcriber: Callable) -> None:
     """Load Whisper and transcribe the job. A job without speaker detection also gets its
-    outputs written here."""
+    outputs written here. A saved transcription is reused without loading Whisper."""
     # no cleanup afterwards: the child ends with os._exit, which frees everything
-    _run_phase1_job(load_transcriber(job.spec.model_key), job, channel)
+    _run_phase1_job(lambda: load_transcriber(job.spec.model_key), job, channel)
 
 
-def _run_phase1_job(transcriber, job: PhaseJob, channel: Channel) -> None:
+def _run_phase1_job(load: Callable, job: PhaseJob, channel: Channel) -> None:
     step = Step.TRANSCRIPTION
     log = make_logger(job.work_dir / WORK_LOG)
     try:
         job.work_dir.mkdir(parents=True, exist_ok=True)
         checkpoint = read_checkpoint(job.work_dir / RAW_CHECKPOINT, job.spec.source)
         if checkpoint is None:
+            transcriber = load()
             source_stat = os.stat(job.spec.source)
             audio, duration = _decode_unchanged(job.spec.source, source_stat, log)
             progress = EventProgress(channel, job.spec.id)
@@ -206,18 +207,19 @@ def _run_phase1_job(transcriber, job: PhaseJob, channel: Channel) -> None:
             channel.send(JobTranscribed(job.spec.id, duration))
             return
         step = Step.OUTPUT
-        _write_outputs(channel, job, transcript, duration, transcriber.backend)
+        _write_outputs(channel, job, transcript, duration, backend_of(job.spec.model))
     except Exception as e:
         _fail(channel, job, step, e, log)
 
 
 def run_phase2(job: PhaseJob, channel: Channel, load_diarizer: Callable) -> None:
-    """Load pyannote, detect the job's speakers and write its outputs."""
+    """Load pyannote, detect the job's speakers and write its outputs. A saved speaker
+    detection is reused without loading pyannote."""
     # no cleanup afterwards: the child ends with os._exit, which frees everything
-    _run_phase2_job(load_diarizer(job.spec.device), job, channel)
+    _run_phase2_job(lambda: load_diarizer(job.spec.device), job, channel)
 
 
-def _run_phase2_job(pipeline, job: PhaseJob, channel: Channel) -> None:
+def _run_phase2_job(load: Callable, job: PhaseJob, channel: Channel) -> None:
     step = Step.DIARIZATION
     log = make_logger(job.work_dir / WORK_LOG)
     try:
@@ -233,6 +235,7 @@ def _run_phase2_job(pipeline, job: PhaseJob, channel: Channel) -> None:
             job.work_dir / DIARIZED_CHECKPOINT, job.spec.source, source_stat
         )
         if checkpoint is None:
+            pipeline = load()
             audio, _ = _decode_unchanged(job.spec.source, source_stat, log)
             progress = EventProgress(channel, job.spec.id)
             transcript = diarize(

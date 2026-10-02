@@ -2,11 +2,12 @@
 
 from datetime import datetime
 
-from aTrain.components.queue_view import FINAL, RUNNING, confirm
+from aTrain.components.queue_view import RUNNING, confirm
 from aTrain_core.globals import TIMESTAMP_FORMAT
+from aTrain_core.jobs import FINAL_STATUSES, JobStatus
 from nicegui import ui
 
-ACTIVE = RUNNING | {"transcribed"}  # transcribed: speaker detection starts right away
+ACTIVE = RUNNING | {JobStatus.TRANSCRIBED}  # transcribed: speaker detection starts right away
 
 
 def elapsed(started_at: str | None) -> str:
@@ -52,14 +53,14 @@ def queue_status(service, start_button) -> None:
 
     def update():
         jobs = service.jobs()
-        open_jobs = [(spec, state) for spec, state in jobs if str(state.status) not in FINAL]
+        open_jobs = [(spec, state) for spec, state in jobs if state.status not in FINAL_STATUSES]
         card.set_visibility(bool(open_jobs))
         label = "Add to queue" if open_jobs else "Start"
         if start_button.text != label:
             start_button.text = label
         if not open_jobs:
             return
-        running = next(((sp, st) for sp, st in open_jobs if str(st.status) in ACTIVE), None)
+        running = next(((sp, st) for sp, st in open_jobs if st.status in ACTIVE), None)
         finished = len(jobs) - len(open_jobs)
         waiting = len(open_jobs) - (1 if running else 0)
         summary.text = f"Job {finished + 1} of {len(jobs)} · {waiting} waiting"
@@ -74,16 +75,16 @@ def queue_status(service, start_button) -> None:
             return
 
         spec, state = running
-        status = str(state.status)
+        status = state.status
         current["id"] = spec.id
         steps = 2 if spec.speaker_detection else 1
-        step.text = f"Step {1 if status == 'transcribing' else 2}/{steps}:"
+        step.text = f"Step {1 if status == JobStatus.TRANSCRIBING else 2}/{steps}:"
         if state.cancelling:
             task.text = "Cancelling…"
         else:
-            task.text = "Transcribing" if status == "transcribing" else "Detecting speakers"
+            task.text = "Transcribing" if status == JobStatus.TRANSCRIBING else "Detecting speakers"
         file.text = spec.display_name
-        progress = 0.0 if status == "transcribed" else state.progress
+        progress = 0.0 if status == JobStatus.TRANSCRIBED else state.progress
         percent.text, bar.value = f"{int(progress * 100)}%", progress
         device.text = f"Running on {spec.device.value.upper()}"
         time.text = f"Time: {elapsed(state.started_at)}"

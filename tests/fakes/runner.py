@@ -29,9 +29,6 @@ class FakeTranscriber:
         progress["current"], progress["total"] = 1, 1
         return {"segments": words_to_segments([{"word": " Hello.", "start": 0.0, "end": 0.5}])}
 
-    def close(self):
-        pass
-
 
 def load_transcriber(key, model_path=None):
     if _config().get("crash_on_load"):

@@ -50,8 +50,6 @@ class Transcriber(Protocol):
         log: Log,
     ) -> dict: ...  # {"segments": [...]}, one segment per word
 
-    def close(self) -> None: ...
-
 
 class FasterWhisperTranscriber:
     backend = "faster-whisper"
@@ -91,9 +89,6 @@ class FasterWhisperTranscriber:
                 words.append({"word": segment.text, "start": segment.start, "end": segment.end})
         return {"segments": words_to_segments(words)}
 
-    def close(self) -> None:
-        self._model = None
-
 
 class CrisperTranscriber:
     backend = "crisper-transformers"
@@ -117,9 +112,6 @@ class CrisperTranscriber:
             progress=progress,
             log=log,
         )
-
-    def close(self) -> None:
-        self._model = None
 
 
 TRANSCRIBERS: dict[str, type[FasterWhisperTranscriber | CrisperTranscriber]] = {

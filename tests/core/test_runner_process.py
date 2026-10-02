@@ -13,12 +13,10 @@ import psutil
 import pytest
 from aTrain_core import runner
 from aTrain_core.globals import TIMESTAMP_FORMAT
-from aTrain_core.settings import ComputeType, Device, ModelKey
 from tests.unit.test_jobs import make_spec
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "sample_short.mp3"
 FACTORY = "tests.fakes.runner:load_transcriber"
-KEY = ModelKey("tiny", Device.CPU, ComputeType.INT8, 2)
 REPO_ROOT = Path(__file__).parent.parent.parent
 
 
@@ -47,13 +45,11 @@ def fake(monkeypatch, **config):
     monkeypatch.setenv("FAKE_RUNNER", json.dumps(config))
 
 
-async def drive(handle: runner.PhaseHandle, jobs: list, on_event=None) -> list:
-    """Answer NextJob from `jobs` like the queue service would; return all events."""
-    jobs, events = list(jobs), []
+async def drive(handle: runner.PhaseHandle, on_event=None) -> list:
+    """Return all events of the child."""
+    events = []
     async for event in handle.events():
         events.append(event)
-        if isinstance(event, runner.NextJob):
-            handle.reply(runner.Dispatch(jobs.pop(0)) if jobs else runner.NoMoreWork())
         if on_event:
             on_event(event)
     return events
@@ -64,47 +60,37 @@ def kinds(events) -> list[str]:
 
 
 def test_events_arrive_in_order(jobs):
-    events = asyncio.run(drive(runner.launch_phase1(KEY, FACTORY), jobs))
+    events = asyncio.run(drive(runner.launch_phase1(jobs[0], FACTORY)))
 
-    assert kinds(events) == [
-        "ModelLoaded",
-        "NextJob",
-        "JobFileId",
-        "JobDone",
-        "NextJob",
-        "JobFileId",
-        "JobDone",
-        "NextJob",
-        "PhaseFinished",
-    ]
-    assert [e.job_id for e in events if isinstance(e, runner.JobDone)] == ["job1", "job2"]
+    assert kinds(events) == ["JobFileId", "JobDone", "PhaseFinished"]
+    assert [e.job_id for e in events if isinstance(e, runner.JobDone)] == ["job1"]
 
 
 def test_crash_during_job_gives_phase_died(jobs, monkeypatch):
-    fake(monkeypatch, crash_on_job=2)
-    events = asyncio.run(drive(runner.launch_phase1(KEY, FACTORY), jobs))
+    fake(monkeypatch, crash_on_job=1)
+    events = asyncio.run(drive(runner.launch_phase1(jobs[0], FACTORY)))
 
-    assert kinds(events)[-3:] == ["JobDone", "NextJob", "PhaseDied"]
+    assert kinds(events) == ["PhaseDied"]
     assert events[-1].exitcode == 1
 
 
-def test_crash_while_loading_gives_phase_died_without_model_loaded(jobs, monkeypatch):
+def test_crash_while_loading_gives_phase_died(jobs, monkeypatch):
     fake(monkeypatch, crash_on_load=True)
-    events = asyncio.run(drive(runner.launch_phase1(KEY, FACTORY), jobs))
+    events = asyncio.run(drive(runner.launch_phase1(jobs[0], FACTORY)))
 
     assert kinds(events) == ["PhaseDied"]
 
 
 def test_kill_during_a_slow_job(jobs, monkeypatch):
     fake(monkeypatch, sleep=60)
-    handle = runner.launch_phase1(KEY, FACTORY)
+    handle = runner.launch_phase1(jobs[0], FACTORY)
 
     def kill_when_transcribing(event):
         if isinstance(event, runner.JobProgress):
             handle.kill()
 
     started = time.monotonic()
-    events = asyncio.run(drive(handle, jobs, kill_when_transcribing))
+    events = asyncio.run(drive(handle, kill_when_transcribing))
 
     assert time.monotonic() - started < 30
     assert not handle.process.is_alive()
@@ -115,15 +101,14 @@ HELPER = """
 import sys, time
 from pathlib import Path
 from aTrain_core import runner
-from aTrain_core.settings import ComputeType, Device, ModelKey
 from tests.unit.test_jobs import make_spec
 
 source, work_dir = Path(sys.argv[2]), Path(sys.argv[3])
 spec = make_spec(id="slow", source=source, display_name=source.name, speaker_detection=False)
-handle = runner.launch_phase1(ModelKey("tiny", Device.CPU, ComputeType.INT8, 2), sys.argv[1])
-while not isinstance(event := handle.conn.recv(), runner.JobProgress):
-    if isinstance(event, runner.NextJob):
-        handle.reply(runner.Dispatch(runner.PhaseJob(spec, "2026-09-30 14-05-12", work_dir)))
+job = runner.PhaseJob(spec, "2026-09-30 14-05-12", work_dir)
+handle = runner.launch_phase1(job, sys.argv[1])
+while not isinstance(handle.conn.recv(), runner.JobProgress):
+    pass
 print(handle.process.pid, flush=True)  # the child is now busy with a 60 s job
 time.sleep(60)
 """

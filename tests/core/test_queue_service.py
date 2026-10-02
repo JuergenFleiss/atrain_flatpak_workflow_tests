@@ -15,9 +15,6 @@ from aTrain_core.runner import (
     JobFileId,
     JobProgress,
     JobTranscribed,
-    ModelLoaded,
-    NextJob,
-    NoMoreWork,
     PhaseDied,
     PhaseFinished,
 )
@@ -26,71 +23,50 @@ from tests.unit.test_jobs import make_spec
 
 
 class FakeHandle:
-    """Behaves like a phase child. Per job id, `outcomes` says what happens:
-    "done" (default), "fail", "crash", "done_then_die" (JobDone is in the pipe when it is
-    killed), or "hang" (works until killed). A job with a gate waits for it first."""
+    """Behaves like a phase child running one job. Per job id, `outcomes` says what
+    happens: "done" (default), "fail", "crash" or "hang" (works until killed). A job with a
+    gate waits for it first."""
 
-    def __init__(self, launcher, phase, arg):
-        self.launcher, self.phase, self.arg = launcher, phase, arg
-        self.replies: asyncio.Queue = asyncio.Queue()
-        self.dispatched: list[str] = []
+    def __init__(self, launcher, phase, job):
+        self.launcher, self.phase, self.job = launcher, phase, job
+        self.killed = asyncio.Event()
 
     async def events(self):
-        launcher = self.launcher
-        if self.phase == 1 and self.arg.model in launcher.load_crash_models:
+        launcher, job = self.launcher, self.job
+        job_id = job.spec.id
+        if self.phase == 1 and job.spec.model in launcher.load_crash_models:
             yield PhaseDied(1)
             return
-        yield ModelLoaded()
-        while True:
-            yield NextJob()
-            reply = await self.replies.get()
-            if reply is None:
-                yield PhaseDied(-9)
-                return
-            if isinstance(reply, NoMoreWork):
-                yield PhaseFinished()
-                return
-            job = reply.job
-            job_id = job.spec.id
-            self.dispatched.append(job_id)
-            if job_id in launcher.gates:
-                await launcher.gates[job_id].wait()
-            outcome = launcher.outcomes.get(job_id, "done")
-            yield JobProgress(job_id, "Transcribe", 1, 2)
-            if outcome == "fail":
-                yield JobFailed(job_id, Step.TRANSCRIPTION, "model error", "Traceback")
-                continue
-            if outcome == "crash":
-                yield PhaseDied(1)
-                return
-            if outcome == "hang":
-                await self.replies.get()  # until killed
-                yield PhaseDied(-9)
-                return
-            if self.phase == 1 and job.spec.speaker_detection:
-                job.work_dir.mkdir(parents=True, exist_ok=True)
-                outputs.write_checkpoint(
-                    job.work_dir / RAW_CHECKPOINT,
-                    transcript={"segments": []},
-                    audio_duration=5,
-                    source=job.spec.source,
-                )
-                yield JobTranscribed(job_id, 5)
-                continue
+        if job_id in launcher.gates:
+            await launcher.gates[job_id].wait()
+        outcome = launcher.outcomes.get(job_id, "done")
+        yield JobProgress(job_id, "Transcribe", 1, 2)
+        if outcome == "fail":
+            yield JobFailed(job_id, Step.TRANSCRIPTION, "model error", "Traceback")
+        elif outcome == "crash":
+            yield PhaseDied(1)
+            return
+        elif outcome == "hang":
+            await self.killed.wait()
+        elif self.phase == 1 and job.spec.speaker_detection:
+            job.work_dir.mkdir(parents=True, exist_ok=True)
+            outputs.write_checkpoint(
+                job.work_dir / RAW_CHECKPOINT,
+                transcript={"segments": []},
+                audio_duration=5,
+                source=job.spec.source,
+            )
+            yield JobTranscribed(job_id, 5)
+        else:
             file_id = f"{job_id}-archive"
             (outputs.TRANSCRIPT_DIR / file_id).mkdir(parents=True)
             yield JobFileId(job_id, file_id)
             yield JobDone(job_id, 5, [])
-            if outcome == "done_then_die":
-                await self.replies.get()
-                yield PhaseDied(-9)
-                return
-
-    def reply(self, answer):
-        self.replies.put_nowait(answer)
+        # events sent before a kill still arrive
+        yield PhaseDied(-9) if self.killed.is_set() else PhaseFinished()
 
     def kill(self):
-        self.replies.put_nowait(None)
+        self.killed.set()
 
 
 class FakeLauncher:
@@ -103,18 +79,18 @@ class FakeLauncher:
         self.launch_error_models: set[str] = set()
 
     def launch(self, phase):
-        def launch(arg):
-            if phase == 1 and arg.model in self.launch_error_models:
+        def launch(job):
+            if phase == 1 and job.spec.model in self.launch_error_models:
                 raise OSError("cannot start the process")
-            self.launches.append((phase, arg))
-            handle = FakeHandle(self, phase, arg)
+            self.launches.append((phase, job))
+            handle = FakeHandle(self, phase, job)
             self.handles.append(handle)
             return handle
 
         return launch
 
     def dispatched(self) -> list[str]:
-        return [job_id for handle in self.handles for job_id in handle.dispatched]
+        return [handle.job.spec.id for handle in self.handles]
 
 
 @pytest.fixture
@@ -181,30 +157,34 @@ async def test_job_without_speaker_detection_is_done_in_phase_1(started):
     assert not store.work_dir("a").exists() and not staged.parent.exists()
 
 
-async def test_speaker_detection_runs_phase_2_after_the_group(started):
+async def test_speaker_detection_runs_right_after_the_transcription(started):
     tmp_path, store, service, launcher = started
     service.enqueue(
         [spec(tmp_path, "a", speaker_detection=True), spec(tmp_path, "b", speaker_detection=True)]
     )
     await settle(service)
 
-    assert [phase for phase, _ in launcher.launches] == [1, 2]
-    assert launcher.dispatched() == ["a", "b", "a", "b"]
+    assert [phase for phase, _ in launcher.launches] == [1, 2, 1, 2]
+    assert launcher.dispatched() == ["a", "a", "b", "b"]
     assert status(store, "a") == status(store, "b") == JobStatus.DONE
 
 
-async def test_grouping_follows_the_head_of_the_queue(started):
+async def test_jobs_run_in_queue_order(started):
     tmp_path, _store, service, launcher = started
     service.pause()
     service.enqueue([spec(tmp_path, "a"), spec(tmp_path, "b", model="small"), spec(tmp_path, "c")])
     service.resume()
     await settle(service)
 
-    assert [arg.model for _, arg in launcher.launches] == ["large-v3-turbo", "small"]
-    assert launcher.dispatched() == ["a", "c", "b"]
+    assert launcher.dispatched() == ["a", "b", "c"]
+    assert [job.spec.model for _, job in launcher.launches] == [
+        "large-v3-turbo",
+        "small",
+        "large-v3-turbo",
+    ]
 
 
-async def test_cancelled_job_of_a_running_group_is_never_handed_out(started):
+async def test_cancelled_job_is_never_started(started):
     tmp_path, store, service, launcher = started
     launcher.gates["a"] = asyncio.Event()
     service.enqueue([spec(tmp_path, "a"), spec(tmp_path, "b"), spec(tmp_path, "c")])
@@ -217,18 +197,6 @@ async def test_cancelled_job_of_a_running_group_is_never_handed_out(started):
 
     assert launcher.dispatched() == ["a", "c"]
     assert status(store, "b") == JobStatus.CANCELLED
-
-
-async def test_job_added_during_the_phase_joins_the_group(started):
-    tmp_path, _store, service, launcher = started
-    launcher.gates["a"] = asyncio.Event()
-    service.enqueue([spec(tmp_path, "a")])
-    await until(lambda: launcher.dispatched() == ["a"])
-    service.enqueue([spec(tmp_path, "b")])
-    launcher.gates["a"].set()
-    await settle(service)
-
-    assert len(launcher.launches) == 1 and launcher.dispatched() == ["a", "b"]
 
 
 async def test_cancel_the_running_job(started):
@@ -247,7 +215,6 @@ async def test_cancel_the_running_job(started):
 
 async def test_job_that_finished_before_the_kill_stays_done(started):
     tmp_path, store, service, launcher = started
-    launcher.outcomes["a"] = "done_then_die"
     launcher.gates["a"] = asyncio.Event()
     service.enqueue([spec(tmp_path, "a")])
     await until(lambda: launcher.dispatched() == ["a"])
@@ -255,9 +222,7 @@ async def test_job_that_finished_before_the_kill_stays_done(started):
     await service.cancel(["a"])  # the kill is requested while the job is in flight...
     assert store.get("a")[1].cancelling
     launcher.gates["a"].set()  # ...but JobDone was already on its way
-    await until(
-        lambda: launcher.handles[0].replies.empty() and status(store, "a") == JobStatus.DONE
-    )
+    await settle(service)
 
     assert status(store, "a") == JobStatus.DONE and not store.get("a")[1].cancelling
     assert (outputs.TRANSCRIPT_DIR / "a-archive").is_dir()
@@ -335,7 +300,7 @@ async def test_missing_source_fails_and_the_next_job_runs(started):
     assert status(store, "b") == JobStatus.DONE
 
 
-async def test_failed_job_does_not_stop_the_group(started):
+async def test_failed_job_does_not_stop_the_queue(started):
     tmp_path, store, service, launcher = started
     launcher.outcomes["a"] = "fail"
     service.enqueue([spec(tmp_path, "a"), spec(tmp_path, "b")])
@@ -347,7 +312,7 @@ async def test_failed_job_does_not_stop_the_group(started):
         Step.TRANSCRIPTION,
         "model error",
     )
-    assert status(store, "b") == JobStatus.DONE and len(launcher.launches) == 1
+    assert status(store, "b") == JobStatus.DONE
 
 
 async def test_crash_while_working_fails_only_that_job(started):
@@ -360,17 +325,16 @@ async def test_crash_while_working_fails_only_that_job(started):
     assert status(store, "b") == JobStatus.DONE
 
 
-async def test_crash_while_loading_fails_the_group_only(started):
+async def test_crash_while_loading_fails_only_that_job(started):
     tmp_path, store, service, launcher = started
     launcher.load_crash_models.add("large-v3-turbo")
     service.pause()
-    service.enqueue([spec(tmp_path, "a"), spec(tmp_path, "b"), spec(tmp_path, "c", model="small")])
+    service.enqueue([spec(tmp_path, "a"), spec(tmp_path, "b", model="small")])
     service.resume()
     await settle(service)
 
-    assert store.get("a")[1].error.startswith("Could not load the model")
-    assert status(store, "b") == JobStatus.FAILED
-    assert status(store, "c") == JobStatus.DONE
+    assert "stopped unexpectedly" in store.get("a")[1].error
+    assert status(store, "b") == JobStatus.DONE
 
 
 async def test_retry_runs_the_job_again(started):
@@ -424,7 +388,7 @@ async def test_status_bug_fails_only_that_job(started):
     assert status(store, "b") == JobStatus.DONE
 
 
-async def test_failed_save_when_handing_out_a_job_fails_only_that_job(started, monkeypatch):
+async def test_failed_save_when_starting_a_job_fails_only_that_job(started, monkeypatch):
     tmp_path, store, service, _launcher = started
     service.pause()
     service.enqueue([spec(tmp_path, "a"), spec(tmp_path, "b")])
@@ -444,7 +408,7 @@ async def test_failed_save_when_handing_out_a_job_fails_only_that_job(started, m
     assert status(store, "b") == JobStatus.DONE
 
 
-async def test_launch_error_fails_the_group_only(started):
+async def test_launch_error_fails_only_that_job(started):
     tmp_path, store, service, launcher = started
     launcher.launch_error_models.add("large-v3-turbo")
     service.pause()

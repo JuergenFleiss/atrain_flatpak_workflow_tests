@@ -56,7 +56,7 @@ def segments(directory: Path) -> list:
     return json.loads((directory / "transcription.json").read_text(encoding="utf-8"))["segments"]
 
 
-def test_group_matches_single_file_runs(data_dir, monkeypatch, tmp_path):
+def test_jobs_match_single_file_runs(data_dir, monkeypatch, tmp_path):
     monkeypatch.setenv("ATRAIN_USER_DIR", str(data_dir))
     timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
     jobs = []
@@ -65,9 +65,8 @@ def test_group_matches_single_file_runs(data_dir, monkeypatch, tmp_path):
         shutil.copy(FIXTURE, source)
         jobs.append(runner.PhaseJob(spec(source, speakers), timestamp, tmp_path / "work" / name))
 
-    key = jobs[0].spec.model_key
-    phase1 = asyncio.run(drive(runner.launch_phase1(key), jobs))
-    phase2 = asyncio.run(drive(runner.launch_phase2(Device.CPU), jobs[:2]))
+    phase1 = [e for job in jobs for e in asyncio.run(drive(runner.launch_phase1(job)))]
+    phase2 = [e for job in jobs[:2] for e in asyncio.run(drive(runner.launch_phase2(job)))]
 
     assert [
         type(e).__name__

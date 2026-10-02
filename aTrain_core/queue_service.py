@@ -1,9 +1,10 @@
 """The queue service: decides which job runs, starts and kills the phase children, and is
 the only writer of the job store. Runs on one asyncio loop; no NiceGUI.
 
-Commands change state without awaiting in between, so they can't interleave with a
-dispatch. The only await in a command is the kill in cancel(); while a child is being
-killed it gets NoMoreWork.
+Jobs run one at a time in queue order: a phase-1 child for the transcription, then a
+phase-2 child for speaker detection. Commands change state without awaiting in between,
+so they can't interleave with starting a job. The only await in a command is the kill in
+cancel().
 """
 
 import asyncio
@@ -27,15 +28,11 @@ from aTrain_core.jobs import (
 )
 from aTrain_core.runner import (
     RAW_CHECKPOINT,
-    Dispatch,
     JobDone,
     JobFailed,
     JobFileId,
     JobProgress,
     JobTranscribed,
-    ModelLoaded,
-    NextJob,
-    NoMoreWork,
     PhaseDied,
     PhaseError,
     PhaseHandle,
@@ -64,11 +61,7 @@ class QueueService:
         self._stopping = False
         # the running phase
         self._handle: PhaseHandle | None = None
-        self._phase: int | None = None
-        self._phase_arg = None  # ModelKey for phase 1, Device for phase 2
-        self._dispatched = 0
         self._in_flight: str | None = None
-        self._killing = False
         self._phase_error: PhaseError | None = None
         self._cancel_requested: set[str] = set()
 
@@ -115,7 +108,6 @@ class QueueService:
             # that has just finished stays DONE (a just transcribed one is CANCELLED).
             self._cancel_requested.add(job_id)
             state.cancelling = True
-            self._killing = True
             if self._handle is not None:
                 await asyncio.to_thread(self._handle.kill)
 
@@ -141,7 +133,7 @@ class QueueService:
         self.store.move(job_id, delta)
 
     def pause(self) -> None:
-        """Hand out no new job; the running one finishes."""
+        """Start no new phase; the running one finishes."""
         self.paused = True
 
     def resume(self) -> None:
@@ -161,13 +153,8 @@ class QueueService:
             self._wake.clear()
             while not (self._stopping or self.paused) and (head := self._head()) is not None:
                 spec, state = head
-                if state.status == JobStatus.QUEUED:
-                    await self._run_phase(1, spec.model_key)
-                    if not (self._stopping or self.paused) and self._eligible(2, spec.device):
-                        # the group's transcripts finish before the next group starts
-                        await self._run_phase(2, spec.device)
-                else:
-                    await self._run_phase(2, spec.device)
+                # a transcribed job stays at the head, so its phase 2 runs next
+                await self._run_phase(1 if state.status == JobStatus.QUEUED else 2, spec)
 
     def _head(self) -> tuple[JobSpec, JobState] | None:
         for spec, state in self.store.jobs():
@@ -175,30 +162,24 @@ class QueueService:
                 return spec, state
         return None
 
-    def _eligible(self, phase: int, arg) -> list[JobSpec]:
-        if phase == 1:
-            return [
-                spec
-                for spec, state in self.store.jobs()
-                if state.status == JobStatus.QUEUED and spec.model_key == arg
-            ]
-        return [
-            spec
-            for spec, state in self.store.jobs()
-            if state.status == JobStatus.TRANSCRIBED and spec.device == arg
-        ]
-
-    async def _run_phase(self, phase: int, arg) -> None:
-        self._phase, self._phase_arg = phase, arg
-        self._dispatched, self._in_flight = 0, None
-        self._killing, self._phase_error = False, None
+    async def _run_phase(self, phase: int, spec: JobSpec) -> None:
+        step = Step.TRANSCRIPTION if phase == 1 else Step.DIARIZATION
+        self._phase_error = None
         try:
-            self._handle = self._launch[phase](arg)
+            if not spec.source.exists():
+                self._fail(spec.id, step, "Source file not found")
+                return
+            started_at = self.store.get(spec.id)[1].started_at or _now()
+            running = JobStatus.TRANSCRIBING if phase == 1 else JobStatus.DIARIZING
+            self.store.update(spec.id, status=running, started_at=started_at)
+            self._in_flight = spec.id
+            job = PhaseJob(spec, started_at, self.store.work_dir(spec.id))
+            self._handle = self._launch[phase](job)
         except Exception as e:
-            # like a child that died while loading: fail the group, don't start it again
-            log.exception("Could not start phase %s", phase)
-            self._phase_error = PhaseError(str(e), format_exc())
-            self._guarded(None, self._phase_died, None)
+            # e.g. queue.json can't be saved or the process can't start: fail this job
+            log.exception("Could not start job %s", spec.id)
+            self._in_flight = None
+            self._guarded(spec.id, self._fail, spec.id, step, f"Internal error: {e}", format_exc())
             return
         try:
             async for event in self._handle.events():
@@ -208,15 +189,7 @@ class QueueService:
             self._cancel_requested.clear()
 
     def _on_event(self, event) -> None:
-        if isinstance(event, ModelLoaded):
-            pass  # nothing to do: the child asks for its first job next
-        elif isinstance(event, NextJob):
-            answer = NoMoreWork()
-            try:
-                answer = self._next_job()
-            finally:
-                self._handle.reply(answer)  # the child waits for an answer, whatever happens
-        elif isinstance(event, PhaseError):
+        if isinstance(event, PhaseError):
             self._phase_error = event
         elif isinstance(event, PhaseDied):
             self._phase_died(event.exitcode)
@@ -250,29 +223,6 @@ class QueueService:
             self._drop_incomplete_output(event.job_id)
             self._fail(event.job_id, event.step, event.error, event.traceback)
 
-    def _next_job(self) -> Dispatch | NoMoreWork:
-        if self._killing or self._stopping or self.paused:
-            return NoMoreWork()
-        step = Step.TRANSCRIPTION if self._phase == 1 else Step.DIARIZATION
-        for spec in self._eligible(self._phase, self._phase_arg):
-            try:
-                if not spec.source.exists():
-                    self._fail(spec.id, step, "Source file not found")
-                    continue
-                state = self.store.get(spec.id)[1]
-                started_at = state.started_at or _now()
-                running = JobStatus.TRANSCRIBING if self._phase == 1 else JobStatus.DIARIZING
-                self.store.update(spec.id, status=running, started_at=started_at)
-            except Exception as e:
-                # e.g. queue.json can't be saved: fail this job, go on with the next
-                log.exception("Could not hand out job %s", spec.id)
-                self._guarded(spec.id, self._fail, spec.id, step, f"Internal error: {e}")
-                continue
-            self._in_flight = spec.id
-            self._dispatched += 1
-            return Dispatch(PhaseJob(spec, started_at, self.store.work_dir(spec.id)))
-        return NoMoreWork()
-
     def _phase_died(self, exitcode: int | None) -> None:
         reason = (
             self._phase_error.error if self._phase_error else f"process ended with code {exitcode}"
@@ -292,12 +242,6 @@ class QueueService:
             else:
                 message = f"Processing stopped unexpectedly (possibly out of memory): {reason}"
                 self._fail(job_id, step, message, traceback)
-        elif self._dispatched == 0 and not (self._stopping or self._killing):
-            # The child died before it could work on anything: fail its group, so the
-            # scheduler doesn't start it again and again.
-            step = Step.TRANSCRIPTION if self._phase == 1 else Step.DIARIZATION
-            for spec in self._eligible(self._phase, self._phase_arg):
-                self._fail(spec.id, step, f"Could not load the model: {reason}", traceback)
 
     def _current_step(self, state: JobState) -> Step:
         if state.file_id is not None:

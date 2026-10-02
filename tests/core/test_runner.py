@@ -7,29 +7,19 @@ import pytest
 from aTrain_core import outputs, runner
 from aTrain_core.backends.common import words_to_segments
 from aTrain_core.jobs import Step
-from aTrain_core.settings import ComputeType, Device, ModelKey
 from tests.unit.test_jobs import make_spec
 
-KEY = ModelKey("tiny", Device.CPU, ComputeType.INT8, 4)
 TIMESTAMP = "2026-09-30 14-05-12"
 
 
 class FakeChannel:
-    """Hands out `jobs`, then NoMoreWork (after `limit` jobs, if given); records events."""
+    """Records the events a child sends."""
 
-    def __init__(self, jobs, limit=None):
-        self.jobs, self.limit, self.events = list(jobs), limit, []
+    def __init__(self):
+        self.events = []
 
     def send(self, event):
         self.events.append(event)
-
-    def next_job(self):
-        self.events.append(runner.NextJob())
-        if not self.jobs or self.limit == 0:
-            return None
-        if self.limit is not None:
-            self.limit -= 1
-        return self.jobs.pop(0)
 
     def of(self, kind):
         return [e for e in self.events if isinstance(e, kind)]
@@ -81,31 +71,27 @@ def make_job(tmp_path, job_id, **overrides) -> runner.PhaseJob:
     return runner.PhaseJob(spec, TIMESTAMP, tmp_path / "work" / job_id)
 
 
-def test_phase1_loads_once_and_stops_at_no_more_work(env):
+def test_phase1_loads_the_model_of_the_job(env):
     tmp_path, _ = env
     loads, transcriber = [], FakeTranscriber()
-    jobs = [make_job(tmp_path, j, speaker_detection=False) for j in ("a", "b", "c")]
-    channel = FakeChannel(jobs, limit=2)
+    job = make_job(tmp_path, "a", speaker_detection=False)
+    channel = FakeChannel()
 
-    runner.run_phase1(KEY, channel, lambda key: loads.append(key) or transcriber)
+    runner.run_phase1(job, channel, lambda key: loads.append(key) or transcriber)
 
-    assert loads == [KEY]
-    assert isinstance(channel.events[0], runner.ModelLoaded)
-    assert [e.job_id for e in channel.of(runner.JobDone)] == ["a", "b"]
-    assert len(channel.jobs) == 1
+    assert loads == [job.spec.model_key]
+    assert [e.job_id for e in channel.of(runner.JobDone)] == ["a"]
 
 
 def test_phase1_writes_outputs_for_jobs_without_speaker_detection(env):
     tmp_path, _ = env
     job = make_job(tmp_path, "a", speaker_detection=False)
-    channel = FakeChannel([job])
+    channel = FakeChannel()
 
-    runner.run_phase1(KEY, channel, lambda key: FakeTranscriber())
+    runner.run_phase1(job, channel, lambda key: FakeTranscriber())
 
-    kinds = [
-        type(e) for e in channel.events if not isinstance(e, runner.JobProgress | runner.NextJob)
-    ]
-    assert kinds == [runner.ModelLoaded, runner.JobFileId, runner.JobDone]
+    kinds = [type(e) for e in channel.events if not isinstance(e, runner.JobProgress)]
+    assert kinds == [runner.JobFileId, runner.JobDone]
     file_id = channel.of(runner.JobFileId)[0].file_id
     directory = tmp_path / "transcriptions" / file_id
     assert (
@@ -118,32 +104,32 @@ def test_phase1_writes_outputs_for_jobs_without_speaker_detection(env):
     assert channel.of(runner.JobProgress)[-1].current == 1.0
 
 
-def test_one_failing_job_does_not_stop_the_group(env):
+def test_failing_job_sends_job_failed(env):
     tmp_path, _ = env
-    jobs = [make_job(tmp_path, j, speaker_detection=False) for j in ("a", "b", "c")]
-    channel = FakeChannel(jobs)
+    job = make_job(tmp_path, "a", speaker_detection=False)
+    channel = FakeChannel()
 
-    runner.run_phase1(KEY, channel, lambda key: FakeTranscriber(fail_on={2}))
+    runner.run_phase1(job, channel, lambda key: FakeTranscriber(fail_on={1}))
 
     failed = channel.of(runner.JobFailed)
     assert [(f.job_id, f.step, f.error) for f in failed] == [
-        ("b", Step.TRANSCRIPTION, "model error")
+        ("a", Step.TRANSCRIPTION, "model error")
     ]
-    assert [e.job_id for e in channel.of(runner.JobDone)] == ["a", "c"]
+    assert channel.of(runner.JobDone) == []
 
 
 def test_speaker_detection_goes_through_both_phases(env):
     tmp_path, diarized = env
     job = make_job(tmp_path, "a")
-    phase1 = FakeChannel([job])
-    runner.run_phase1(KEY, phase1, lambda key: FakeTranscriber())
+    phase1 = FakeChannel()
+    runner.run_phase1(job, phase1, lambda key: FakeTranscriber())
     assert [
         type(e) for e in phase1.events if isinstance(e, runner.JobTranscribed | runner.JobDone)
     ] == [runner.JobTranscribed]
     assert (job.work_dir / runner.RAW_CHECKPOINT).is_file()
 
-    phase2 = FakeChannel([job])
-    runner.run_phase2(Device.CPU, phase2, lambda device: "pipeline")
+    phase2 = FakeChannel()
+    runner.run_phase2(job, phase2, lambda device: "pipeline")
 
     assert len(diarized) == 1 and (job.work_dir / runner.DIARIZED_CHECKPOINT).is_file()
     file_id = phase2.of(runner.JobFileId)[0].file_id
@@ -161,9 +147,9 @@ def test_valid_checkpoints_are_reused(env):
         )
     transcriber = FakeTranscriber()
 
-    runner.run_phase1(KEY, FakeChannel([job]), lambda key: transcriber)
-    phase2 = FakeChannel([job])
-    runner.run_phase2(Device.CPU, phase2, lambda device: "pipeline")
+    runner.run_phase1(job, FakeChannel(), lambda key: transcriber)
+    phase2 = FakeChannel()
+    runner.run_phase2(job, phase2, lambda device: "pipeline")
 
     assert transcriber.calls == [] and diarized == []
     assert phase2.of(runner.JobDone)[0].audio_duration == 3
@@ -177,9 +163,9 @@ def test_output_error_keeps_checkpoints(env, monkeypatch):
 
     monkeypatch.setattr(runner, "write_final_outputs", broken)
     job = make_job(tmp_path, "a")
-    runner.run_phase1(KEY, FakeChannel([job]), lambda key: FakeTranscriber())
-    channel = FakeChannel([job])
-    runner.run_phase2(Device.CPU, channel, lambda device: "pipeline")
+    runner.run_phase1(job, FakeChannel(), lambda key: FakeTranscriber())
+    channel = FakeChannel()
+    runner.run_phase2(job, channel, lambda device: "pipeline")
 
     assert [(f.step, f.error) for f in channel.of(runner.JobFailed)] == [(Step.OUTPUT, "disk full")]
     assert (job.work_dir / runner.RAW_CHECKPOINT).is_file()
@@ -189,11 +175,11 @@ def test_output_error_keeps_checkpoints(env, monkeypatch):
 def test_phase2_with_changed_source_fails_without_diarizing(env):
     tmp_path, diarized = env
     job = make_job(tmp_path, "a")
-    runner.run_phase1(KEY, FakeChannel([job]), lambda key: FakeTranscriber())
+    runner.run_phase1(job, FakeChannel(), lambda key: FakeTranscriber())
     Path(job.spec.source).write_bytes(b"another recording")
 
-    channel = FakeChannel([job])
-    runner.run_phase2(Device.CPU, channel, lambda device: "pipeline")
+    channel = FakeChannel()
+    runner.run_phase2(job, channel, lambda device: "pipeline")
 
     failed = channel.of(runner.JobFailed)[0]
     assert failed.step == Step.DIARIZATION and "recording changed" in failed.error
@@ -209,9 +195,9 @@ def test_source_replaced_during_transcription_is_not_diarized(env):
             Path(job.spec.source).write_bytes(b"another recording")
             return super().transcribe(audio, **kwargs)
 
-    runner.run_phase1(KEY, FakeChannel([job]), lambda key: ReplacingTranscriber())
-    channel = FakeChannel([job])
-    runner.run_phase2(Device.CPU, channel, lambda device: "pipeline")
+    runner.run_phase1(job, FakeChannel(), lambda key: ReplacingTranscriber())
+    channel = FakeChannel()
+    runner.run_phase2(job, channel, lambda device: "pipeline")
 
     assert "recording changed" in channel.of(runner.JobFailed)[0].error
     assert diarized == []
@@ -222,18 +208,18 @@ def test_source_changed_while_decoding_fails_the_job(env, monkeypatch, phase):
     tmp_path, diarized = env
     job = make_job(tmp_path, "a")
     if phase == 2:
-        runner.run_phase1(KEY, FakeChannel([job]), lambda key: FakeTranscriber())
+        runner.run_phase1(job, FakeChannel(), lambda key: FakeTranscriber())
 
     def decode_while_replaced(source, log):
         Path(source).write_bytes(b"another recording")
         return np.zeros(16000, np.float32), 1
 
     monkeypatch.setattr(runner, "decode", decode_while_replaced)
-    transcriber, channel = FakeTranscriber(), FakeChannel([job])
+    transcriber, channel = FakeTranscriber(), FakeChannel()
     if phase == 1:
-        runner.run_phase1(KEY, channel, lambda key: transcriber)
+        runner.run_phase1(job, channel, lambda key: transcriber)
     else:
-        runner.run_phase2(Device.CPU, channel, lambda device: "pipeline")
+        runner.run_phase2(job, channel, lambda device: "pipeline")
 
     failed = channel.of(runner.JobFailed)[0]
     assert "changed while it was read" in failed.error
@@ -242,7 +228,7 @@ def test_source_changed_while_decoding_fails_the_job(env, monkeypatch, phase):
 
 def test_event_progress_throttles_and_flushes_the_last_value():
     sent, now = [], [0.0]
-    channel = FakeChannel([])
+    channel = FakeChannel()
     channel.send = sent.append
     progress = runner.EventProgress(channel, "a", interval=0.2, clock=lambda: now[0])
 

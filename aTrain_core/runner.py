@@ -1,9 +1,8 @@
-"""Child processes that run the two phases of a group of jobs.
+"""Child processes that run the two phases of one job.
 
-Phase 1 loads Whisper once and transcribes; phase 2 loads pyannote once and detects
-speakers. A child never gets a list of jobs: after loading its model it asks the parent
-for one job at a time, so jobs cancelled, removed or reordered meanwhile are handled by
-the parent. Children are spawned, and exit when the parent dies.
+Phase 1 loads Whisper and transcribes; phase 2 loads pyannote and detects speakers. Each
+child gets one job, sends events to the parent and exits, which frees its model. Children
+are spawned, and exit when the parent dies.
 """
 
 import asyncio
@@ -32,7 +31,6 @@ from aTrain_core.outputs import (
     write_checkpoint,
     write_final_outputs,
 )
-from aTrain_core.settings import Device, ModelKey
 
 RAW_CHECKPOINT = "raw_transcript.json"
 DIARIZED_CHECKPOINT = "diarized_transcript.json"
@@ -50,16 +48,6 @@ class PhaseJob:
 
 
 # child -> parent
-@dataclass(frozen=True, slots=True)
-class ModelLoaded:
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class NextJob:
-    pass
-
-
 @dataclass(frozen=True, slots=True)
 class JobProgress:
     job_id: str
@@ -106,17 +94,6 @@ class PhaseError:
     traceback: str
 
 
-# parent -> child
-@dataclass(frozen=True, slots=True)
-class Dispatch:
-    job: PhaseJob
-
-
-@dataclass(frozen=True, slots=True)
-class NoMoreWork:
-    pass
-
-
 # made up by the parent when a child ended without PhaseFinished
 @dataclass(frozen=True, slots=True)
 class PhaseDied:
@@ -127,20 +104,6 @@ class Channel(Protocol):
     """The child's side of the connection to the parent."""
 
     def send(self, event: Any) -> None: ...
-    def next_job(self) -> PhaseJob | None: ...
-
-
-class PipeChannel:
-    def __init__(self, conn: Connection):
-        self._conn = conn
-
-    def send(self, event: Any) -> None:
-        self._conn.send(event)
-
-    def next_job(self) -> PhaseJob | None:
-        self._conn.send(NextJob())
-        reply = self._conn.recv()
-        return reply.job if isinstance(reply, Dispatch) else None
 
 
 class EventProgress(MutableMapping):
@@ -201,14 +164,11 @@ def _decode_unchanged(source: Path, source_stat: os.stat_result, log):
     return audio, duration
 
 
-def run_phase1(key: ModelKey, channel: Channel, load_transcriber: Callable) -> None:
-    """Load Whisper once, then transcribe the jobs the parent hands out. Jobs without
-    speaker detection also get their outputs written here."""
-    transcriber = load_transcriber(key)
-    channel.send(ModelLoaded())
+def run_phase1(job: PhaseJob, channel: Channel, load_transcriber: Callable) -> None:
+    """Load Whisper and transcribe the job. A job without speaker detection also gets its
+    outputs written here."""
     # no cleanup afterwards: the child ends with os._exit, which frees everything
-    while (job := channel.next_job()) is not None:
-        _run_phase1_job(transcriber, job, channel)
+    _run_phase1_job(load_transcriber(job.spec.model_key), job, channel)
 
 
 def _run_phase1_job(transcriber, job: PhaseJob, channel: Channel) -> None:
@@ -251,14 +211,10 @@ def _run_phase1_job(transcriber, job: PhaseJob, channel: Channel) -> None:
         _fail(channel, job, step, e, log)
 
 
-def run_phase2(device: Device, channel: Channel, load_diarizer: Callable) -> None:
-    """Load pyannote once, then detect speakers for the jobs the parent hands out and
-    write their outputs."""
-    pipeline = load_diarizer(device)
-    channel.send(ModelLoaded())
+def run_phase2(job: PhaseJob, channel: Channel, load_diarizer: Callable) -> None:
+    """Load pyannote, detect the job's speakers and write its outputs."""
     # no cleanup afterwards: the child ends with os._exit, which frees everything
-    while (job := channel.next_job()) is not None:
-        _run_phase2_job(pipeline, job, channel)
+    _run_phase2_job(load_diarizer(job.spec.device), job, channel)
 
 
 def _run_phase2_job(pipeline, job: PhaseJob, channel: Channel) -> None:
@@ -329,15 +285,15 @@ def _fail(channel: Channel, job: PhaseJob, step: Step, error: Exception, log) ->
 
 
 def phase1_main(
-    key: ModelKey, conn: Connection, factory: str = "aTrain_core.engine:load_transcriber"
+    job: PhaseJob, conn: Connection, factory: str = "aTrain_core.engine:load_transcriber"
 ) -> NoReturn:
-    _child_main(conn, lambda channel: run_phase1(key, channel, _load_factory(factory)))
+    _child_main(conn, lambda channel: run_phase1(job, channel, _load_factory(factory)))
 
 
 def phase2_main(
-    device: Device, conn: Connection, factory: str = "aTrain_core.engine:load_diarizer"
+    job: PhaseJob, conn: Connection, factory: str = "aTrain_core.engine:load_diarizer"
 ) -> NoReturn:
-    _child_main(conn, lambda channel: run_phase2(device, channel, _load_factory(factory)))
+    _child_main(conn, lambda channel: run_phase2(job, channel, _load_factory(factory)))
 
 
 def _load_factory(path: str) -> Callable:
@@ -349,15 +305,14 @@ def _load_factory(path: str) -> Callable:
 
 def _child_main(conn: Connection, work: Callable[[Channel], None]) -> NoReturn:
     _start_parent_watchdog()
-    channel = PipeChannel(conn)
     code = 0
     try:
-        work(channel)
-        channel.send(PhaseFinished())
+        work(conn)
+        conn.send(PhaseFinished())
     except BaseException as e:
         code = 1
         with suppress(Exception):
-            channel.send(PhaseError(str(e), format_exc()))
+            conn.send(PhaseError(str(e), format_exc()))
     with suppress(Exception):
         conn.close()
     # Skip interpreter shutdown: faster-whisper can hang there
@@ -389,8 +344,8 @@ class PhaseHandle:
         self.conn = conn
 
     async def events(self) -> AsyncIterator[Any]:
-        """Yield the child's events in order, including NextJob (answer with reply()).
-        After the child has ended, yields PhaseDied unless it sent PhaseFinished."""
+        """Yield the child's events in order. After the child has ended, yields PhaseDied
+        unless it sent PhaseFinished."""
         finished = False
         while True:
             alive = self.process.is_alive()
@@ -411,28 +366,24 @@ class PhaseHandle:
         except (EOFError, OSError):
             return
 
-    def reply(self, answer: Dispatch | NoMoreWork) -> None:
-        with suppress(OSError):  # the child may have died meanwhile
-            self.conn.send(answer)
-
     def kill(self) -> None:
         self.process.kill()
         self.process.join(5)
 
 
-def launch_phase1(key: ModelKey, factory: str | None = None) -> PhaseHandle:
-    return _launch(phase1_main, key, factory, "aTrain phase 1")
+def launch_phase1(job: PhaseJob, factory: str | None = None) -> PhaseHandle:
+    return _launch(phase1_main, job, factory, "aTrain phase 1")
 
 
-def launch_phase2(device: Device, factory: str | None = None) -> PhaseHandle:
-    return _launch(phase2_main, device, factory, "aTrain phase 2")
+def launch_phase2(job: PhaseJob, factory: str | None = None) -> PhaseHandle:
+    return _launch(phase2_main, job, factory, "aTrain phase 2")
 
 
-def _launch(target, arg, factory: str | None, name: str) -> PhaseHandle:
+def _launch(target, job: PhaseJob, factory: str | None, name: str) -> PhaseHandle:
     # spawn on every platform: no inherited CUDA state and nothing copied from the GUI
     context = multiprocessing.get_context("spawn")
-    parent_conn, child_conn = context.Pipe(duplex=True)
-    args = (arg, child_conn) if factory is None else (arg, child_conn, factory)
+    parent_conn, child_conn = context.Pipe(duplex=False)
+    args = (job, child_conn) if factory is None else (job, child_conn, factory)
     process = context.Process(target=target, args=args, name=name, daemon=False)
     process.start()
     child_conn.close()  # so the parent sees EOF when the child ends

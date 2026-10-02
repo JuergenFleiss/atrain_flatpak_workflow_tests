@@ -42,14 +42,13 @@ def queue_status(service, start_button) -> None:
     card.mark("queue_status")
 
     current = {"id": None}
-    stop.on_click(
-        lambda: (
-            current["id"]
-            and confirm(
-                "Stop the current job?", lambda: service.cancel([current["id"]]), lambda: None
-            )
-        )
-    )
+
+    def confirm_stop():
+        job_id = current["id"]
+        if job_id is not None:
+            confirm("Stop the current job?", lambda: service.cancel([job_id]), lambda: None)
+
+    stop.on_click(confirm_stop)
 
     def update():
         jobs = service.jobs()

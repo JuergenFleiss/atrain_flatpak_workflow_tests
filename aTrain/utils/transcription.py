@@ -1,3 +1,4 @@
+import shutil
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +73,8 @@ async def start_payloads(payloads: list[UploadPayload], export_dir: Path | None 
     # Snapshot rather than read live: the page re-renders while an upload is staged,
     # and `get_model_options` resets `model` to None whenever no model is on disk yet.
     state = cast(State, dict(app.storage.general))
+    staged: list[Path] = []
+    enqueued = False
     try:
         device = Device.GPU if state.get("GPU") else Device.CPU
         # Validate first: it needs nothing but the name and the settings, and rejecting a
@@ -83,18 +86,24 @@ async def start_payloads(payloads: list[UploadPayload], export_dir: Path | None 
             job_id = uuid4().hex
             staging = service.store.uploads_root / job_id
             if payload.path is None:
-                staging.mkdir(parents=True, exist_ok=True)
+                staging.mkdir(parents=True)
+                staged.append(staging)
             source = await payload.materialise(staging, secure_filename(payload.name) or "upload")
             spec = build_spec_from_state(
                 state, job_id=job_id, source=source, display_name=payload.name
             )
             specs.append(replace(spec, export_dir=export_dir))
         service.enqueue(specs)
+        enqueued = True
     except QueueLockedError:
         ui.notify(LOCKED_TEXT, color="negative", multi_line=True)
         return
     except Exception as e:
         dialog_error(error=str(e), traceback=traceback.format_exc())
         return
+    finally:
+        if not enqueued:
+            for staging in staged:
+                shutil.rmtree(staging, ignore_errors=True)
     added = payloads[0].name if len(specs) == 1 else f"{len(specs)} files"
     ui.notify(f"{added} added to the queue")

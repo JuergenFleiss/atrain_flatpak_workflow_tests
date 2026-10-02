@@ -97,8 +97,12 @@ class QueueService:
         self._wake.set()
 
     async def cancel(self, job_ids: list[str]) -> None:
+        handle = None
         for job_id in job_ids:
-            _, state = self.store.get(job_id)
+            try:
+                _, state = self.store.get(job_id)
+            except KeyError:  # removed while a confirmation dialog was open
+                continue
             if state.status in FINAL_STATUSES:
                 continue
             if job_id != self._in_flight:
@@ -108,8 +112,11 @@ class QueueService:
             # that has just finished stays DONE (a just transcribed one is CANCELLED).
             self._cancel_requested.add(job_id)
             state.cancelling = True
-            if self._handle is not None:
-                await asyncio.to_thread(self._handle.kill)
+            handle = self._handle
+        # Cancel every waiting entry before yielding to the scheduler, and kill only
+        # the child captured above even if the scheduler advances while we await it.
+        if handle is not None:
+            await asyncio.to_thread(handle.kill)
 
     def retry(self, job_id: str) -> None:
         _, state = self.store.get(job_id)
@@ -247,7 +254,9 @@ class QueueService:
     def _current_step(self, state: JobState) -> Step:
         if state.file_id is not None:
             return Step.OUTPUT
-        return Step.TRANSCRIPTION if state.status == JobStatus.TRANSCRIBING else Step.DIARIZATION
+        if state.status in (JobStatus.TRANSCRIBED, JobStatus.DIARIZING):
+            return Step.DIARIZATION
+        return Step.TRANSCRIPTION
 
     # --- helpers ----------------------------------------------------------------------
 
@@ -259,9 +268,23 @@ class QueueService:
         self.store.update(job_id, status=resume_status(spec, raw_checkpoint_valid=raw is not None))
 
     def _fail(self, job_id: str, step: Step, error: str, traceback: str | None = None) -> None:
-        self.store.update(
-            job_id, status=JobStatus.FAILED, failed_step=step, error=error, traceback=traceback
-        )
+        try:
+            self.store.update(
+                job_id, status=JobStatus.FAILED, failed_step=step, error=error, traceback=traceback
+            )
+        except OSError as e:
+            # Even the failure cannot be saved. Show it for this session and stop
+            # scheduling; the last durable state and checkpoints allow restart recovery.
+            self.paused = True
+            _, state = self.store.get(job_id)
+            state.status = JobStatus.FAILED
+            state.failed_step = step
+            state.error = (
+                f"{error}\nQueue paused because its state could not be saved: {e}. "
+                "Free disk space or restore write access, then retry and resume the queue."
+            )
+            state.traceback = traceback
+            log.exception("Could not save failure for job %s; queue paused", job_id)
         self._finish(job_id)
 
     def _finish(self, job_id: str) -> None:
@@ -288,7 +311,7 @@ class QueueService:
             try:
                 _, state = self.store.get(job_id)
                 if state.status not in FINAL_STATUSES:
-                    step = state.failed_step or Step.TRANSCRIPTION
+                    step = state.failed_step or self._current_step(state)
                     self._fail(job_id, step, f"Internal error: {e}")
             except Exception:
                 log.exception("Could not mark job %s as failed", job_id)

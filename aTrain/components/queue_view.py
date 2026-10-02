@@ -60,7 +60,9 @@ def queue_view(service) -> None:
         pause.text = "Resume" if service.paused else "Pause"
         cancel_all.set_enabled(any(state.status not in FINAL for _, state in jobs))
         clear.set_enabled(any(state.status in FINAL for _, state in jobs))
-        signature = [(spec.id, state.status, state.cancelling) for spec, state in jobs]
+        signature = [
+            (spec.id, state.status, state.cancelling, tuple(state.warnings)) for spec, state in jobs
+        ]
         if signature != last_signature:
             last_signature = signature
             job_list.refresh()
@@ -101,6 +103,14 @@ def job_row(service, spec, state, progress_bars: dict, refresh) -> None:
 
 def status_label(state, status: str) -> None:
     text = "Cancelling…" if state.cancelling else STATUS_TEXT.get(status, status)
+    if status == "done" and state.warnings:
+        ui.button(
+            "Done with warnings",
+            icon="warning",
+            color="amber-900",
+            on_click=lambda: show_warnings(state.warnings),
+        ).props("flat dense no-caps")
+        return
     if status != "failed":
         ui.label(text).classes("font-light")
         return
@@ -110,6 +120,15 @@ def status_label(state, status: str) -> None:
     label.on(
         "click", lambda: dialog_error(error=state.error or "", traceback=state.traceback or "")
     )
+
+
+def show_warnings(warnings: list[str]) -> None:
+    with ui.dialog(value=True) as dialog, ui.card().classes("p-6 gap-4"):
+        ui.label("Transcription completed").classes("font-bold text-dark")
+        ui.label("The transcript is available in the archive.")
+        for warning in warnings:
+            ui.label(warning).classes("whitespace-pre-line break-all")
+        ui.button("Close", color="dark", on_click=dialog.close).props("unelevated no-caps")
 
 
 def action_button(text: str, on_click) -> None:

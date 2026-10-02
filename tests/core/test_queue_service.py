@@ -213,6 +213,18 @@ async def test_cancel_the_running_job(started):
     assert len(launcher.launches) == 2  # b ran in a new child
 
 
+async def test_cancel_skips_jobs_removed_while_confirming(started):
+    tmp_path, store, service, launcher = started
+    service.pause()
+    service.enqueue([spec(tmp_path, "a"), spec(tmp_path, "b")])
+    service.remove("a")
+
+    await service.cancel(["a", "b"])
+
+    assert status(store, "b") == JobStatus.CANCELLED
+    assert launcher.dispatched() == []
+
+
 async def test_job_that_finished_before_the_kill_stays_done(started):
     tmp_path, store, service, launcher = started
     launcher.gates["a"] = asyncio.Event()
@@ -412,11 +424,11 @@ async def test_failed_save_when_starting_a_job_fails_only_that_job(started, monk
     service.enqueue([spec(tmp_path, "a"), spec(tmp_path, "b")])
     save, failures = store._save, []
 
-    def flaky_save():
-        if store.get("a")[1].status == JobStatus.TRANSCRIBING and not failures:
+    def flaky_save(jobs):
+        if jobs[0][1].status == JobStatus.TRANSCRIBING and not failures:
             failures.append(True)
             raise OSError("disk full")
-        save()
+        save(jobs)
 
     monkeypatch.setattr(store, "_save", flaky_save)
     service.resume()

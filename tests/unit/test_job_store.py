@@ -3,6 +3,7 @@
 import json
 
 import pytest
+from aTrain_core import jobs
 from aTrain_core.jobs import InvalidTransitionError, JobStatus, JobStore
 from tests.unit.test_jobs import make_spec
 
@@ -105,7 +106,7 @@ def test_clear_finished_saves_once_and_deletes_work_folders(tmp_path, monkeypatc
         store.update(job_id, status=JobStatus.CANCELLED)
         store.work_dir(job_id).mkdir(parents=True)
     saves = []
-    monkeypatch.setattr(store, "_save", lambda: saves.append(ids(store)))
+    monkeypatch.setattr(store, "_save", lambda jobs: saves.append([spec.id for spec, _ in jobs]))
 
     store.clear_finished()
 
@@ -121,3 +122,39 @@ def test_reload_reads_what_another_store_saved(tmp_path):
     store.reload()
 
     assert store.get("a")[1].status == JobStatus.TRANSCRIBING
+
+
+@pytest.mark.parametrize("operation", ["add", "update", "move", "remove", "clear_finished"])
+def test_failed_save_preserves_memory_disk_and_files(tmp_path, monkeypatch, operation):
+    store = JobStore(tmp_path / "queue")
+    store.add([make_spec(id="a"), make_spec(id="b")])
+    store.update("a", status=JobStatus.CANCELLED)
+    upload = store.uploads_root / "a" / "audio.mp3"
+    upload.parent.mkdir(parents=True)
+    upload.write_bytes(b"audio")
+    checkpoint = store.work_dir("a") / "checkpoint.json"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text("checkpoint")
+    state = store.get("a")[1]
+    before = [(spec.to_json(), state.to_json()) for spec, state in store.jobs()]
+    saved = store.path.read_bytes()
+
+    def disk_full(*args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(jobs.os, "replace", disk_full)
+    actions = {
+        "add": lambda: store.add([make_spec(id="c")]),
+        "update": lambda: store.update("a", status=JobStatus.QUEUED, error="changed"),
+        "move": lambda: store.move("a", 1),
+        "remove": lambda: store.remove("a"),
+        "clear_finished": store.clear_finished,
+    }
+    with pytest.raises(OSError, match="disk full"):
+        actions[operation]()
+
+    assert [(spec.to_json(), state.to_json()) for spec, state in store.jobs()] == before
+    assert store.get("a")[1] is state
+    assert store.path.read_bytes() == saved
+    assert upload.read_bytes() == b"audio"
+    assert checkpoint.read_text() == "checkpoint"

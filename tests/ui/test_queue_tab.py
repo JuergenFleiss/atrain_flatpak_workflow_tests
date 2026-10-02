@@ -6,8 +6,8 @@ import asyncio
 import aTrain_core.transcribe  # noqa: F401  pre-import so the splash import is instant
 import pytest
 from aTrain.components.settings.file import folder_summary
-from aTrain.utils import queue_ui
-from aTrain.utils.transcription import start_paths
+from aTrain.utils import queue_ui, transcription
+from aTrain.utils.transcription import UploadPayload, start_paths, start_payloads
 from aTrain_core.jobs import JobStatus, JobStore, QueueLockedError
 from aTrain_core.queue_service import QueueService
 from aTrain_core.settings import ComputeType, Device
@@ -282,3 +282,90 @@ async def test_one_file_goes_to_the_queue_without_a_dialog(service, tmp_path, us
     assert [spec.display_name for spec, _ in service.jobs()] == ["one.mp3"]
     await user.should_see("one.mp3 added to the queue")
     await user.should_not_see(kind=ui.dialog)
+
+
+async def test_stop_confirmation_keeps_the_original_job(service, tmp_path, user: User, monkeypatch):
+    add(service, tmp_path, "a", S.TRANSCRIBING)
+    add(service, tmp_path, "b")
+    await user.open("/")
+    await user.should_see("a.mp3", retries=200)
+    user.find(kind=ui.button, content="Stop").click()
+    await user.should_see("Stop the current job?")
+    service.store.update("a", status=S.DONE)
+    service.store.update("b", status=S.TRANSCRIBING)
+    await user.should_see("b.mp3", retries=200)
+    cancel, calls = service.cancel, []
+
+    async def record_cancel(ids):
+        calls.append(ids)
+        await cancel(ids)
+
+    monkeypatch.setattr(service, "cancel", record_cancel)
+    user.find(marker="confirm_ok").click()
+    await until(lambda: calls)
+    assert calls == [["a"]]
+    assert service.store.get("b")[1].status == S.TRANSCRIBING
+
+
+async def test_export_warning_is_shown(service, tmp_path, user: User):
+    add(service, tmp_path, "a", S.TRANSCRIBING)
+    await user.open("/queue")
+    warning = "Copy to /media/usb/transcriptions failed: disk full"
+    service.store.update("a", status=S.DONE, file_id="a-result", warnings=[warning])
+    await user.should_see("Done with warnings", retries=20)
+    user.find(kind=ui.button, content="Done with warnings").click()
+    await user.should_see(warning)
+
+
+async def test_failed_upload_batch_cleans_only_new_staging(
+    service, tmp_path, user: User, monkeypatch
+):
+    await user.open("/queue")
+    app.storage.general.update(CHEAP_SETTINGS)
+    add(service, tmp_path, "existing")
+    previous_upload = service.store.uploads_root / "existing" / "keep.mp3"
+    previous_upload.parent.mkdir(parents=True)
+    previous_upload.write_bytes(b"keep")
+    native_source = tmp_path / "native.mp3"
+    native_source.write_bytes(b"native audio")
+    errors = []
+    monkeypatch.setattr(transcription, "dialog_error", lambda **kw: errors.append(kw))
+
+    class Upload:
+        def __init__(self, last=False):
+            self.last = last
+
+        async def save(self, target):
+            target.write_bytes(b"audio")
+            if self.last:
+                raise OSError("disk full")
+
+    payloads = [
+        UploadPayload(name="a.mp3", upload=Upload()),
+        UploadPayload(name=native_source.name, path=native_source),
+        UploadPayload(name="b.mp3", upload=Upload(last=True)),
+    ]
+    with user:
+        await start_payloads(payloads)
+    assert "disk full" in errors[0]["error"]
+
+    assert [spec.id for spec, _ in service.jobs()] == ["existing"]
+    assert list(service.store.uploads_root.iterdir()) == [previous_upload.parent]
+    assert previous_upload.read_bytes() == b"keep"
+    assert native_source.read_bytes() == b"native audio"
+
+
+async def test_successful_upload_batch_keeps_staged_files(service, user: User):
+    await user.open("/queue")
+    app.storage.general.update(CHEAP_SETTINGS)
+    payloads = [
+        UploadPayload(
+            name=name,
+            upload=ui.upload.SmallFileUpload(name, "audio/mpeg", b"audio"),
+        )
+        for name in ("a.mp3", "b.mp3")
+    ]
+    with user:
+        await start_payloads(payloads)
+    assert [spec.display_name for spec, _ in service.jobs()] == ["a.mp3", "b.mp3"]
+    assert all(spec.source.read_bytes() == b"audio" for spec, _ in service.jobs())

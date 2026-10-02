@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import shutil
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from enum import StrEnum, auto
 from pathlib import Path
@@ -207,8 +207,9 @@ class JobStore:
             if spec.id in known:
                 raise ValueError(f"Job {spec.id} is already in the queue")
             known.add(spec.id)
-        self._jobs.extend((spec, JobState()) for spec in specs)
-        self._save()
+        jobs = self._jobs + [(spec, JobState()) for spec in specs]
+        self._save(jobs)
+        self._jobs = jobs
 
     def get(self, job_id: str) -> tuple[JobSpec, JobState]:
         return self._jobs[self._index(job_id)]
@@ -219,32 +220,41 @@ class JobStore:
     def update(self, job_id: str, **changes) -> JobState:
         """Change saved state fields. A new `status` is checked against ALLOWED.
         `progress` and `cancelling` are memory only; set them on the state directly."""
-        spec, state = self.get(job_id)
+        index = self._index(job_id)
+        spec, state = self._jobs[index]
         status = changes.get("status", state.status)
         if status != state.status:
             check_transition(spec, state.status, status)
+        jobs = self._jobs.copy()
+        jobs[index] = (spec, replace(state, **changes))
+        self._save(jobs)
+        # Keep existing readers' state references live, but only after the write succeeds.
         for name, value in changes.items():
             setattr(state, name, value)
-        self._save()
         return state
 
     def move(self, job_id: str, delta: int) -> None:
         index = self._index(job_id)
         target = max(0, min(len(self._jobs) - 1, index + delta))
-        self._jobs.insert(target, self._jobs.pop(index))
-        self._save()
+        jobs = self._jobs.copy()
+        jobs.insert(target, jobs.pop(index))
+        self._save(jobs)
+        self._jobs = jobs
 
     def remove(self, job_id: str) -> None:
         """Remove the entry and delete its work folder and staged upload.
         A source outside queue/uploads/ is never touched."""
-        del self._jobs[self._index(job_id)]
-        self._save()
+        jobs = self._jobs.copy()
+        del jobs[self._index(job_id)]
+        self._save(jobs)
+        self._jobs = jobs
         self._delete_files(job_id)
 
     def clear_finished(self) -> list[str]:
         finished = [spec.id for spec, state in self._jobs if state.status in FINAL_STATUSES]
-        self._jobs = [job for job in self._jobs if job[1].status not in FINAL_STATUSES]
-        self._save()
+        jobs = [job for job in self._jobs if job[1].status not in FINAL_STATUSES]
+        self._save(jobs)
+        self._jobs = jobs
         for job_id in finished:
             self._delete_files(job_id)
         return finished
@@ -280,13 +290,12 @@ class JobStore:
             logging.warning("Could not read %s (%s); moved it to %s", self.path, e, unreadable)
             return []
 
-    def _save(self) -> None:
+    def _save(self, jobs: list[tuple[JobSpec, JobState]]) -> None:
+        """Persist a proposed change before exposing it to readers or deleting files."""
         self.root.mkdir(parents=True, exist_ok=True)
         data = {
             "schema_version": SCHEMA_VERSION,
-            "jobs": [
-                {"spec": spec.to_json(), "state": state.to_json()} for spec, state in self._jobs
-            ],
+            "jobs": [{"spec": spec.to_json(), "state": state.to_json()} for spec, state in jobs],
         }
         tmp = self.path.with_name(QUEUE_FILENAME + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:

@@ -81,7 +81,8 @@ def job_row(service, spec, state, progress_bars: dict, refresh) -> None:
                 ui.tooltip(settings_details(spec)).classes("whitespace-pre-line")
             status_label(state, status)
             bar = ui.linear_progress(value=state.progress, show_value=False, color="dark")
-            bar.set_visibility(status in RUNNING)
+            if status not in RUNNING:
+                bar.classes("invisible")  # keeps its grid cell, so Actions stay in their column
             progress_bars[spec.id] = bar
             with ui.row().classes("gap-1 items-center"):
                 if status == "done":

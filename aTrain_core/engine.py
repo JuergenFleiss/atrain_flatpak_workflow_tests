@@ -73,7 +73,6 @@ class FasterWhisperTranscriber:
             beam_size=5,
             word_timestamps=True,
             language=None if language == "auto-detect" else language,
-            max_new_tokens=None if self._model_type == "distil" else 128,
             no_speech_threshold=0.6,
             condition_on_previous_text=self._model_type != "distil",
             initial_prompt=initial_prompt,

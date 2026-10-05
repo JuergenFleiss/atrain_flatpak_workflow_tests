@@ -3,13 +3,16 @@ from aTrain.components.settings.advanced import seed_defaults
 from aTrain.components.settings.file import input_file
 from aTrain.components.settings.language import input_language
 from aTrain.components.settings.model import input_model
-from aTrain.components.settings.speaker_count import input_speaker_count
-from aTrain.components.settings.speaker_detection import input_speaker_detection
+from aTrain.components.settings.speakers import input_speakers
 from aTrain.components.splash_screen import splash_screen
 from aTrain.layouts.base import base_layout
-from aTrain.utils.transcription import start_paths, start_uploads
-from aTrain_core.globals import FLATPAK, LINUX
-from nicegui import Client, app, ui
+from fastapi.responses import RedirectResponse
+from nicegui import Client, ui
+
+
+@ui.page("/queue")
+def queue_page():
+    return RedirectResponse("/")  # the queue is on the transcribe page now
 
 
 @ui.page("/")
@@ -31,34 +34,25 @@ async def page(client: Client):
     with base_layout():
         if locked:
             ui.label(queue_ui.LOCKED_TEXT).classes("w-full p-3 bg-amber-100 text-dark rounded")
-        portal = (FLATPAK or LINUX) and app.native.main_window is not None
 
-        async def start():
-            if file.selected_paths:  # picked files or a folder on disk
-                await start_paths(file.selected_paths, file.export_dir)
-            elif portal or file.mode.value == "Folder":
-                ui.notify("Please select a file or a folder with files first", color="negative")
-            else:
-                file.upload()  # browser upload; start_uploads runs when it's done
+        def update_add():
+            count = len(files.names)
+            add.text = f"Add {count} files to queue" if count > 1 else "Add to queue"
+            add.set_enabled(bool(count) and not files.uploading and not locked)
+
+        async def add_to_queue():
+            await files.submit()
+            open_list()
 
         with ui.element("div").classes(
-            "w-full h-full grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-10"
+            "w-full grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_300px] gap-8"
         ):
-            file = input_file()
-            input_model()
-            input_language()
-            input_speaker_detection()
-            input_speaker_count()
-            # third column even while Number of Speakers is hidden
-            with ui.element("div").classes(
-                "self-stretch flex items-end justify-end lg:col-start-3"
-            ):
-                start_btn = ui.button("Start", on_click=start, color="dark")
-                start_btn.props("no-caps unelevated")
-            if locked:
-                start_btn.disable()
-        ui.separator().classes("mt-4")
-        if not locked:
-            queue_status(service, start_btn)
-
-    file.on_multi_upload(start_uploads)
+            files = input_file(on_change=lambda: update_add())
+            with ui.column().classes("w-full gap-3.5"):
+                input_model()
+                input_language()
+                input_speakers()
+                add = ui.button("Add to queue", on_click=add_to_queue, color="dark")
+                add.props("no-caps unelevated").classes("w-full h-11 mt-1").mark("add_to_queue")
+        update_add()
+        open_list = queue_status(service) if not locked else lambda: None

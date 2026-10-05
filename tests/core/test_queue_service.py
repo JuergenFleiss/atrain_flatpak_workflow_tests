@@ -199,6 +199,58 @@ async def test_cancelled_job_is_never_started(started):
     assert status(store, "b") == JobStatus.CANCELLED
 
 
+def ids(service):
+    return [spec.id for spec, _ in service.jobs()]
+
+
+def test_move_swaps_queued_neighbours_only(env):
+    tmp_path, store, service, _launcher = env
+    store.add([spec(tmp_path, job_id) for job_id in "abcde"])
+    store.update("a", status=JobStatus.TRANSCRIBING)  # running
+    store.update("c", status=JobStatus.CANCELLED)
+
+    service.move("d", -1)  # over the cancelled job to b, not below the running job
+    assert ids(service) == ["a", "d", "b", "c", "e"]
+    service.move("d", -1)  # first queued
+    service.move("a", 1)  # not queued
+    service.move("c", -1)  # not queued
+    service.move("e", 1)  # last queued
+    assert ids(service) == ["a", "d", "b", "c", "e"]
+    service.move("d", 1)
+    assert ids(service) == ["a", "b", "d", "c", "e"]
+    service.move("d", 1)  # over the cancelled job to e
+    assert ids(service) == ["a", "b", "c", "e", "d"]
+
+
+def test_retry_moves_the_job_to_the_end(env):
+    tmp_path, store, service, _launcher = env
+    store.add([spec(tmp_path, job_id) for job_id in "abc"])
+    store.update("a", status=JobStatus.FAILED, error="boom")
+
+    service.retry("a")
+
+    assert ids(service) == ["b", "c", "a"]
+    assert status(store, "a") == JobStatus.QUEUED
+    assert JobStore(store.root).jobs()[2][0].id == "a"  # saved
+
+
+async def test_moved_order_survives_a_restart_and_is_run(env):
+    tmp_path, store, service, launcher = env
+    store.add([spec(tmp_path, job_id) for job_id in "abc"])
+    service.move("c", -1)
+    service.move("c", -1)
+
+    restarted = QueueService(
+        JobStore(store.root), launch_phase1=launcher.launch(1), launch_phase2=launcher.launch(2)
+    )
+    await restarted.start()
+    try:
+        await settle(restarted)
+    finally:
+        await restarted.stop()
+    assert launcher.dispatched() == ["c", "a", "b"]
+
+
 async def test_cancel_the_running_job(started):
     tmp_path, store, service, launcher = started
     launcher.outcomes["a"] = "hang"

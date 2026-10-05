@@ -119,9 +119,11 @@ class QueueService:
             await asyncio.to_thread(handle.kill)
 
     def retry(self, job_id: str) -> None:
+        """Back into the queue, at its end."""
         _, state = self.store.get(job_id)
         if state.status not in (JobStatus.FAILED, JobStatus.CANCELLED):
             raise ValueError("Only failed or cancelled jobs can be retried")
+        self.store.move(job_id, len(self.store.jobs()))
         self.store.update(
             job_id, error=None, traceback=None, failed_step=None, warnings=[], started_at=None
         )
@@ -137,7 +139,16 @@ class QueueService:
         self.store.clear_finished()
 
     def move(self, job_id: str, delta: int) -> None:
-        self.store.move(job_id, delta)
+        """Swap a queued job with its queued neighbour (delta -1 up, +1 down). Running and
+        finished jobs keep their places; a no-op for other jobs and at the ends."""
+        jobs = self.store.jobs()
+        queued = [i for i, (_, state) in enumerate(jobs) if state.status == JobStatus.QUEUED]
+        index = next((i for i, (spec, _) in enumerate(jobs) if spec.id == job_id), None)
+        if index not in queued:
+            return
+        target = queued.index(index) + delta
+        if 0 <= target < len(queued):
+            self.store.move(job_id, queued[target] - index)
 
     def pause(self) -> None:
         """Start no new phase; the running one finishes."""

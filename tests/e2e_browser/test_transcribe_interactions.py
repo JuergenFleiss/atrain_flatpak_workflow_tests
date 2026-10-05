@@ -10,22 +10,28 @@ Quasar produces).
 from playwright.sync_api import Page, expect
 
 
-def test_speaker_detection_toggle_reveals_speaker_count(atrain_server: str, page: Page) -> None:
-    """Speaker-count column is bound to the `speaker_detection` flag
-    (speaker_count.py::input_speaker_count → bind_visibility). Toggling
-    the switch must show/hide the column in the actual DOM."""
+def test_speakers_select_takes_a_custom_count(atrain_server: str, page: Page) -> None:
+    """The "More" row below the Speakers options is a number input inside the select's
+    menu (speakers.py::input_speakers). Typing in it and pressing Enter must reach the
+    input, not the select's keyboard navigation."""
     page.goto(atrain_server)
-    speaker_count = page.get_by_text("Number of Speakers")
-    expect(speaker_count).to_be_hidden()
+    speakers = page.locator(".q-select").nth(2)  # Model, Language, Speakers
+    expect(page.get_by_text("Speakers", exact=True)).to_be_visible(timeout=60_000)
 
-    # Two "Speaker Detection" strings render (section header + switch label).
-    # The switch label is the second occurrence; .last targets it.
-    switch_label = page.get_by_text("Speaker Detection").last
-    switch_label.click()
-    expect(speaker_count).to_be_visible()
+    speakers.click()
+    menu = page.locator(".q-menu")
+    menu.get_by_text("2 speakers", exact=True).click()
+    expect(speakers).to_contain_text("2 speakers")
 
-    switch_label.click()
-    expect(speaker_count).to_be_hidden()
+    speakers.click()
+    number = menu.locator("input[type=number]")
+    number.fill("2")
+    number.press("Enter")
+    expect(menu.get_by_text("Enter a whole number from 3 to 99.")).to_be_visible()
+    number.fill("12")
+    number.press("Enter")
+    expect(menu).to_be_hidden()
+    expect(speakers).to_contain_text("12 speakers")
 
 
 def test_sidebar_opens_advanced_settings(atrain_server: str, page: Page) -> None:

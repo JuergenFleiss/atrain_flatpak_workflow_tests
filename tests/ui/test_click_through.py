@@ -1,8 +1,8 @@
 """Full UI E2E via NiceGUI's in-process User fixture (no browser).
 
 Renders the real transcription page and drives a transcription through the
-app's real wiring (upload handler -> queue -> phase children -> "Done" on the
-Queue tab), with the tiny model on CPU. Complements the lighter
+app's real wiring (upload handler -> queue -> phase children -> "Done" in the
+queue list), with the tiny model on CPU. Complements the lighter
 boot-serve smoke.
 """
 
@@ -20,7 +20,7 @@ FIXTURE = Path(__file__).parent.parent / "fixtures" / "sample_short.mp3"
 
 async def test_main_page_renders(user: User):
     await user.open("/")
-    await user.should_see(kind=ui.button, content="Start", retries=100)
+    await user.should_see(kind=ui.button, content="Add to queue", retries=100)
 
 
 CHEAP_SETTINGS = {
@@ -60,7 +60,7 @@ async def test_transcribe_through_ui(user: User):
     )
     with user:
         await start_uploads(upload_event)
-    await user.open("/queue")
+    await user.open("/")
     await user.should_see("Done", retries=600)
 
 
@@ -89,7 +89,7 @@ async def test_large_upload_is_staged_from_disk(tmp_path):
 
 
 async def test_picked_path_reaches_the_pipeline_unchanged(monkeypatch):
-    """Native-picker path (Linux/Flatpak): the Start button hands us a path.
+    """Native-picker path (Linux/Flatpak): Add to queue hands us a path.
 
     This second entry point bypasses NiceGUI's upload entirely. CI runs on
     Linux, where `transcribe.py` wires *only* this branch - so without a test

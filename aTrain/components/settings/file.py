@@ -1,210 +1,134 @@
 import os
 from pathlib import Path
 
+from aTrain.utils.file_selection import FileSelection
 from aTrain_core.globals import FLATPAK, LINUX
 from aTrain_core.settings import load_formats
-from nicegui import app, run, ui
+from nicegui import app, ui
 
-PREVIEW_FILES = 5
-
-
-class CustomUpload(ui.upload):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.on("added", self.set_added)
-        self.set_select()
-
-    def pick_files(self):
-        self.reset()
-        self.set_select()
-        self.run_method("pickFiles")
-
-    def upload(self):
-        self.run_method("upload")
-
-    def set_added(self, event=None):
-        count = len(event.args) if event is not None and isinstance(event.args, list) else 1
-        self.file_text = "1 File Added" if count == 1 else f"{count} Files Added"
-        self.file_icon = "file_present"
-
-    def set_select(self):
-        self.file_text = "Select File"
-        self.file_icon = "attach_file"
+# Swapped in the browser while files are dragged over the drop zone (no server round trip).
+IDLE = "'border-gray-300', 'bg-gray-50'"
+DRAGGING = "'border-gray-800', 'bg-gray-100'"
+DRAG_OVER = (
+    f"(e) => {{ e.preventDefault(); const c = e.currentTarget.classList; "
+    f"c.remove({IDLE}); c.add({DRAGGING}); }}"
+)
+DRAG_END = f"const c = e.currentTarget.classList; c.remove({DRAGGING}); c.add({IDLE});"
 
 
-def folder_summary(folder: Path, files: list[Path]) -> str:
-    """ "12 supported files found (3 other files ignored)", the first names and "and 7 more"."""
-    others = sum(1 for p in folder.iterdir() if p.is_file() and not p.name.startswith(".")) - len(
-        files
-    )
-    text = f"{len(files)} supported files found" + (
-        f" ({others} other files ignored)" if others else ""
-    )
-    names = [f.name for f in files[:PREVIEW_FILES]]
-    if len(files) > PREVIEW_FILES:
-        names.append(f"and {len(files) - PREVIEW_FILES} more")
-    return "\n".join([text, *names])
-
-
-def input_file() -> CustomUpload:
-    """Pick one or several files, or (in a native window) a folder. The page reads
-    `selected_paths` and `export_dir`; browser uploads go through the uploader."""
+def input_file(on_change) -> FileSelection:
+    """The drop zone: drop or browse files, or (in a native window) pick a folder.
+    `on_change` runs whenever the selection changes."""
     allowed_files = "".join(x for x in str(load_formats()) if x not in "[]'")
-    uploader = CustomUpload(multiple=True).classes("hidden")
+    uploader = ui.upload(multiple=True).classes("hidden")
     uploader.props(f"accept='{allowed_files}' batch")
-    uploader.selected_paths = []
-    uploader.export_dir = None
     native = app.native.main_window is not None
     portal = (FLATPAK or LINUX) and native
+    selection = FileSelection(uploader, portal)
+    qref = f"getElement({uploader.id}).$refs.qRef"
+    names_js = f"() => emit({qref}.files.map(f => f.name))"
+    uploader.on("added", lambda e: selection.set_uploads(e.args), js_handler=names_js)
+    uploader.on("removed", lambda e: selection.set_uploads(e.args), js_handler=names_js)
+    uploader.on_rejected(lambda: ui.notify("Only audio and video files can be added"))
+    # sent: the files leave the selection (this reports back through "removed")
+    uploader.on("uploaded", js_handler=f"() => {qref}.removeUploadedFiles()")
+    uploader.on_multi_upload(selection.uploaded)
+    uploader.on("failed", selection.upload_failed, args=[])
 
-    with ui.column().classes("gap-2"):
-        ui.label("Select File").classes("font-bold text-dark text-md")
-        ui.separator()
-        mode = ui.toggle(["Files", "Folder"], value="Files").props("no-caps unelevated")
-        mode.set_visibility(native)
-        with ui.button() as select_button:
-            select_button.props("color=gray-100 text-color=dark align=left")
-            select_button.props("unelevated no-caps :ripple=false")
-            select_button.classes("w-full h-full")
-        file_label = ui.label("").classes("text-sm text-gray-500 whitespace-pre-line")
-        export = ui.checkbox("Also save a copy next to the source files").classes("text-sm")
-        export.set_visibility(False)
-    uploader.mode = mode
+    zone = ui.element("div").classes(
+        "w-full min-h-[260px] flex flex-col rounded-lg border-[1.5px] border-dashed "
+        "border-gray-300 bg-gray-50 transition-colors"
+    )
+    zone.on("dragover", js_handler=DRAG_OVER)
+    zone.on(
+        "dragleave",
+        js_handler=f"(e) => {{ if (e.currentTarget.contains(e.relatedTarget)) return; {DRAG_END} }}",
+    )
+    # A browser hands over the files. WebKitGTK (Linux window) doesn't: there the window
+    # process sends their paths (aTrain.utils.linux_drop), read like picked files.
+    zone.on(
+        "drop",
+        js_handler=f"(e) => {{ e.preventDefault(); {DRAG_END} "
+        f"if (e.dataTransfer.files.length) {qref}.addFiles(e.dataTransfer.files); }}",
+    )
+    if portal:
+        from aTrain.utils.linux_drop import EVENT
 
-    def show(paths: list[Path], text: str, folder: Path | None = None):
-        uploader.selected_paths = paths
-        file_label.text = text
-        export.set_visibility(folder is not None)
-        export.value = False
-        uploader.export_folder = folder
-        if folder is not None and not os.access(folder, os.W_OK):
-            file_label.text += (
-                "\nThis folder is read-only: a copy next to the files is not possible."
-            )
-            export.disable()
-        else:
-            export.enable()
+        ui.on(EVENT, selection.add_dropped)
+    zone.mark("drop_zone")
+    zone.selection = selection  # type: ignore[attr-defined]  # for the tests
 
-    def update_export(e):
-        folder = getattr(uploader, "export_folder", None)
-        uploader.export_dir = folder / "transcriptions" if e.value and folder else None
-
-    export.on_value_change(update_export)
-
-    def show_folder(folder: str | None):
-        if not folder:
+    @ui.refreshable
+    def content():
+        names = selection.names
+        if not names:
+            empty_state(native, selection)
             return
-        from aTrain_core.discovery import discover_media_files
-
-        folder_path = Path(folder)
-        files = discover_media_files(folder_path)
-        show(files, folder_summary(folder_path, files), folder_path)
-
-    def on_mode_change():
-        uploader.reset()
-        show([], "")
-        folder_mode = mode.value == "Folder"
-        uploader.file_text = "Select Folder" if folder_mode else "Select File"
-        uploader.file_icon = "folder_open" if folder_mode else "attach_file"
-        select_button.text = uploader.file_text  # the portal button isn't bound
-
-    mode.on_value_change(on_mode_change)
-
-    if not portal:
-        select_button.bind_text(uploader, "file_text")
-        select_button.bind_icon(uploader, "file_icon")
-
-        async def on_select():
-            if mode.value == "Files":
-                show([], "")
-                uploader.pick_files()
+        with ui.column().classes("flex-1 w-full p-3 gap-1.5 no-wrap"):
+            with ui.row().classes("w-full justify-between items-center px-2 pb-1.5"):
+                count = f"{len(names)} file{'s' if len(names) != 1 else ''} selected"
+                ui.label(count).classes("text-[13px] font-medium text-gray-600")
+                if not selection.uploading:
+                    clear = ui.label("Clear").classes(
+                        "text-[13px] text-grey underline cursor-pointer"
+                    )
+                    clear.on("click", selection.clear)
+            with ui.column().classes("w-full gap-1.5 no-wrap max-h-[320px] overflow-auto"):
+                for index, name in enumerate(names):
+                    with ui.row().classes(
+                        "w-full items-center gap-2.5 no-wrap bg-white rounded-md px-2.5 py-1.5 text-sm"
+                    ):
+                        ui.icon("audio_file", color="grey").classes("text-lg")
+                        ui.label(name).classes("flex-1 min-w-0 truncate")
+                        if not selection.uploading:
+                            ui.button(
+                                icon="close", on_click=lambda i=index: selection.remove(i)
+                            ).props("flat round dense size=sm color=grey")
+            if selection.uploading:
+                ui.label("Uploading…").classes("px-2 pt-1 text-[13px] text-gray-600")
                 return
-            import webview  # type: ignore
+            if selection.folder is not None:
+                folder_options(selection, selection.folder)
+            more = ui.button("Add more files", icon="add", on_click=selection.browse_files)
+            more.props("flat no-caps color=grey-8").classes("w-full mt-1")
 
-            result = await app.native.main_window.create_file_dialog(webview.FileDialog.FOLDER)
-            show_folder(result[0] if result else None)
-            uploader.file_text = "Folder selected" if uploader.selected_paths else "Select Folder"
+    def changed():
+        content.refresh()
+        on_change()
 
-        select_button.on_click(on_select)
-        return uploader
+    selection.on_change = changed
+    with zone:
+        content()
+    return selection
 
-    select_button.text = "Select Files"
 
-    def pick_native(directory: bool) -> list[str]:
-        try:
-            import gi  # type: ignore
+def empty_state(native: bool, selection: FileSelection) -> None:
+    with ui.column().classes(
+        "flex-1 w-full items-center justify-center gap-2.5 p-8 text-center cursor-pointer"
+    ) as empty:
+        ui.icon("upload_file", color="grey").classes("text-[36px]")
+        ui.label("Drop audio or video files").classes("text-[15px] font-medium")
+        with ui.row().classes("gap-1 justify-center text-[13px] text-grey"):
+            ui.label("or")
+            ui.label("browse").classes("font-medium text-dark underline")
+            if native:
+                ui.label("· files or a whole")
+                folder = ui.label("folder").classes("font-medium text-dark underline")
+                folder.on("click.stop", selection.browse_folder)
+            else:
+                ui.label("· one or more files")
+    empty.on("click", selection.browse_files)
 
-            gi.require_version("Gio", "2.0")
-            gi.require_version("GLib", "2.0")
-            from gi.repository import Gio, GLib  # type: ignore
 
-            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-            proxy = Gio.DBusProxy.new_sync(
-                bus,
-                Gio.DBusProxyFlags.NONE,
-                None,
-                "org.freedesktop.portal.Desktop",
-                "/org/freedesktop/portal/desktop",
-                "org.freedesktop.portal.FileChooser",
-                None,
-            )
-
-            token = f"atrain{os.getpid()}"
-            options = {
-                "handle_token": GLib.Variant("s", token),
-                "multiple": GLib.Variant("b", not directory),
-                "directory": GLib.Variant("b", directory),
-            }
-
-            result = proxy.call_sync(
-                "OpenFile",
-                GLib.Variant(
-                    "(ssa{sv})", ("", "Select Folder" if directory else "Select Files", options)
-                ),
-                Gio.DBusCallFlags.NONE,
-                -1,
-                None,
-            )
-            handle = result.unpack()[0]
-
-            request = Gio.DBusProxy.new_sync(
-                bus,
-                Gio.DBusProxyFlags.NONE,
-                None,
-                "org.freedesktop.portal.Desktop",
-                handle,
-                "org.freedesktop.portal.Request",
-                None,
-            )
-
-            filenames: list[str] = []
-            loop = GLib.MainLoop()
-
-            def on_response(_proxy, _sender, _signal, params):
-                response, results = params.unpack()
-                if response == 0:
-                    for uri in results.get("uris") or []:
-                        filenames.append(Gio.File.new_for_uri(uri).get_path())
-                loop.quit()
-
-            request.connect("g-signal", on_response)
-            loop.run()
-            return filenames
-        except Exception as exc:
-            print(f"Flatpak portal file dialog failed: {exc}")
-            return []
-
-    async def on_pick():
-        # The portal call blocks; run it in a thread so the UI stays connected.
-        picked = await run.io_bound(pick_native, mode.value == "Folder")
-        if not picked:
-            return
-        if mode.value == "Folder":
-            show_folder(picked[0])
-            return
-        paths = [Path(p) for p in picked]
-        show(paths, "\n".join(p.name for p in paths))
-
-    select_button.on_click(on_pick)
-
-    return uploader
+def folder_options(selection: FileSelection, folder: Path) -> None:
+    ignored = selection.ignored
+    if ignored:
+        note = f"{ignored} other file{'s' if ignored != 1 else ''} in the folder ignored"
+        ui.label(note).classes("px-2 pt-1 text-[13px] text-gray-600")
+    export = ui.checkbox("Also save a copy next to the source files", value=selection.export)
+    export.classes("text-sm").bind_value_to(selection, "export")
+    if not os.access(folder, os.W_OK):
+        export.disable()
+        ui.label("This folder is read-only: a copy next to the files is not possible.").classes(
+            "px-2 text-[13px] text-gray-600"
+        )
